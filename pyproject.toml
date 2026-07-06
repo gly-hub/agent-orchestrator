@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-orchestrator"
+name = "dandelion-orchestrator"
 version = "0.1.0"
 description = "Composable Agent Workflow Engine with resumable human checkpoints."
 readme = "README.md"
@@ -23,9 +23,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/example/agent-orchestrator"
-Documentation = "https://github.com/example/agent-orchestrator#readme"
-Issues = "https://github.com/example/agent-orchestrator/issues"
+Homepage = "https://github.com/gly-hub/agent-orchestrator"
+Documentation = "https://github.com/gly-hub/agent-orchestrator#readme"
+Issues = "https://github.com/gly-hub/agent-orchestrator/issues"
 
 [project.optional-dependencies]
 sqlite = []

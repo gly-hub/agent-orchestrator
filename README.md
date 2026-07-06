@@ -259,7 +259,7 @@ Redis providers accept `url`, `prefix`, and optional retention knobs. Install
 the optional dependency before using them:
 
 ```bash
-pip install "agent-orchestrator[redis]"
+pip install "dandelion-orchestrator[redis]"
 ```
 
 ```python
@@ -861,7 +861,7 @@ agent/tool/transform logic:
 Install the optional dependency when using the Claude runner:
 
 ```bash
-pip install 'agent-orchestrator[claude]'
+pip install 'dandelion-orchestrator[claude]'
 ```
 
 Register the runner like any other agent handler:

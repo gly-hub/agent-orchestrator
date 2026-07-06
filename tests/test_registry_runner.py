@@ -50,7 +50,13 @@ class FakeAssistantMessage:
 
 
 class FakeResultMessage:
-    pass
+    def __init__(self, result=None):
+        self.result = result
+
+
+class FakeStreamEvent:
+    def __init__(self, event):
+        self.event = event
 
 
 class FakeClaudeAgentOptions:
@@ -94,6 +100,7 @@ FAKE_CLAUDE_SDK = SimpleNamespace(
     ClaudeSDKClient=FakeClaudeSDKClient,
     AssistantMessage=FakeAssistantMessage,
     ResultMessage=FakeResultMessage,
+    StreamEvent=FakeStreamEvent,
     TextBlock=FakeTextBlock,
     ToolUseBlock=FakeToolUseBlock,
     ToolResultBlock=FakeToolResultBlock,
@@ -158,3 +165,52 @@ class RegistryRunnerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].data["text"], "hello world")
         self.assertEqual(FakeClaudeSDKClient.last_client.queried_prompt, "Prompt: hi")
         self.assertTrue(FakeClaudeSDKClient.last_client.disconnected)
+
+    async def test_claude_agent_runner_streams_partial_message_deltas(self):
+        class PartialClaudeSDKClient(FakeClaudeSDKClient):
+            async def receive_response(self):
+                yield FakeStreamEvent(
+                    {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "hel"},
+                    }
+                )
+                yield FakeStreamEvent(
+                    {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "lo"},
+                    }
+                )
+                yield FakeAssistantMessage([FakeTextBlock("hello")])
+                yield FakeResultMessage()
+
+        fake_sdk = SimpleNamespace(
+            **{
+                **FAKE_CLAUDE_SDK.__dict__,
+                "ClaudeSDKClient": PartialClaudeSDKClient,
+            }
+        )
+        runner = ClaudeAgentRunner(
+            ClaudeAgentRunnerConfig(options={"include_partial_messages": True}),
+            sdk_module=fake_sdk,
+        )
+        run_state = RunState(
+            run_id="run_partial",
+            workflow_id="wf",
+            workflow_version=1,
+            status="running",
+            state={},
+            current_node_id="claude",
+        )
+
+        events = [event async for event in runner({"message": "hi"}, run_state)]
+
+        self.assertEqual(
+            [event.type for event in events],
+            ["agent.delta", "agent.delta", "agent.output"],
+        )
+        self.assertEqual(
+            [event.data["text"] for event in events if event.type == "agent.delta"],
+            ["hel", "lo"],
+        )
+        self.assertEqual(events[-1].data["text"], "hello")

@@ -41,20 +41,36 @@ class ClaudeAgentRunner:
         prompt = self._build_prompt(agent_input)
 
         text_parts: list[str] = []
+        final_text_parts: list[str] = []
+        saw_stream_delta = False
         await client.connect()
         try:
             await client.query(prompt)
             async for msg in client.receive_response():
-                if isinstance(msg, sdk.AssistantMessage):
+                if self._is_sdk_type(msg, sdk, "StreamEvent"):
+                    text = self._extract_stream_text_delta(getattr(msg, "event", None))
+                    if text:
+                        saw_stream_delta = True
+                        text_parts.append(text)
+                        yield WorkflowEvent(
+                            type="agent.delta",
+                            run_id=run_state.run_id,
+                            node_id=run_state.current_node_id,
+                            data={"text": text},
+                        )
+                elif isinstance(msg, sdk.AssistantMessage):
+                    message_text_parts: list[str] = []
                     for block in msg.content:
                         if isinstance(block, sdk.TextBlock):
-                            text_parts.append(block.text)
-                            yield WorkflowEvent(
-                                type="agent.delta",
-                                run_id=run_state.run_id,
-                                node_id=run_state.current_node_id,
-                                data={"text": block.text},
-                            )
+                            message_text_parts.append(block.text)
+                            if not saw_stream_delta:
+                                text_parts.append(block.text)
+                                yield WorkflowEvent(
+                                    type="agent.delta",
+                                    run_id=run_state.run_id,
+                                    node_id=run_state.current_node_id,
+                                    data={"text": block.text},
+                                )
                         elif isinstance(block, sdk.ToolUseBlock):
                             yield WorkflowEvent(
                                 type="agent.tool_use",
@@ -77,14 +93,18 @@ class ClaudeAgentRunner:
                                     "is_error": getattr(block, "is_error", None),
                                 },
                             )
+                    if message_text_parts:
+                        final_text_parts.extend(message_text_parts)
                 elif isinstance(msg, sdk.ResultMessage):
+                    if getattr(msg, "result", None):
+                        final_text_parts = [str(msg.result)]
                     break
 
             yield WorkflowEvent(
                 type="agent.output",
                 run_id=run_state.run_id,
                 node_id=run_state.current_node_id,
-                data={"text": "".join(text_parts)},
+                data={"text": "".join(final_text_parts or text_parts)},
             )
         finally:
             await client.disconnect()
@@ -95,3 +115,32 @@ class ClaudeAgentRunner:
         if "message" in agent_input:
             return str(agent_input["message"])
         return json.dumps(agent_input, ensure_ascii=False, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _is_sdk_type(msg: Any, sdk: Any, type_name: str) -> bool:
+        sdk_type = getattr(sdk, type_name, None)
+        if sdk_type is not None:
+            return isinstance(msg, sdk_type)
+        return msg.__class__.__name__ == type_name
+
+    @staticmethod
+    def _extract_stream_text_delta(event: Any) -> str:
+        if not isinstance(event, dict):
+            return ""
+
+        event_type = event.get("type")
+        if event_type == "content_block_delta":
+            delta = event.get("delta")
+            if isinstance(delta, dict):
+                delta_type = delta.get("type")
+                if delta_type == "text_delta":
+                    return str(delta.get("text") or "")
+                if delta_type == "input_json_delta":
+                    return ""
+
+        if event_type == "content_block_start":
+            block = event.get("content_block")
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "")
+
+        return ""

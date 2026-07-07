@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dandelion-orchestrator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Composable Agent Workflow Engine with resumable human checkpoints."
 readme = "README.md"
 requires-python = ">=3.12"

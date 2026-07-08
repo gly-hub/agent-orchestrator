@@ -1,11 +1,7 @@
-import sys
 import tempfile
-import unittest
 from pathlib import Path
 
-PROJECT_SRC = Path(__file__).resolve().parents[1] / "src"
-if str(PROJECT_SRC) not in sys.path:
-    sys.path.insert(0, str(PROJECT_SRC))
+import pytest
 
 from agent_orchestrator import (
     InMemoryCheckpointStore,
@@ -26,116 +22,112 @@ from agent_orchestrator import (
 from agent_orchestrator.exceptions import WorkflowError
 
 
-class PersistencePluginsTest(unittest.IsolatedAsyncioTestCase):
-    async def test_custom_checkpoint_store_provider_can_be_registered(self):
-        registry = PersistencePluginRegistry()
-        created = []
+async def test_custom_checkpoint_store_provider_can_be_registered():
+    registry = PersistencePluginRegistry()
+    created = []
 
-        def create_custom(config):
-            created.append(config["dsn"])
-            return InMemoryCheckpointStore()
+    def create_custom(config):
+        created.append(config["dsn"])
+        return InMemoryCheckpointStore()
 
-        registry.checkpoints.register("custom-db", create_custom)
-        store = create_checkpoint_store(
-            {"provider": "custom-db", "dsn": "db://workflow"},
+    registry.checkpoints.register("custom-db", create_custom)
+    store = create_checkpoint_store(
+        {"provider": "custom-db", "dsn": "db://workflow"},
+        registry=registry,
+    )
+
+    assert isinstance(store, InMemoryCheckpointStore)
+    assert created == ["db://workflow"]
+
+async def test_sqlite_store_providers_are_registered():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "workflow.sqlite"
+        checkpoint_store = create_checkpoint_store(
+            {"provider": "sqlite", "path": str(path)}
+        )
+        event_store = create_event_store(
+            {"provider": "sqlite", "path": str(path)}
+        )
+
+    assert isinstance(checkpoint_store, SQLiteCheckpointStore)
+    assert isinstance(event_store, SQLiteEventStore)
+
+async def test_core_persistence_plugins_exclude_optional_sqlite_provider():
+    registry = core_persistence_plugins()
+
+    with pytest.raises(WorkflowError, match="store provider not registered: sqlite"):
+        create_checkpoint_store({"provider": "sqlite", "path": "/tmp/workflow.sqlite"}, registry=registry)
+
+async def test_sqlite_provider_can_be_registered_as_optional_store_plugin():
+    registry = register_sqlite_stores(core_persistence_plugins())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "workflow.sqlite"
+        checkpoint_store = create_checkpoint_store(
+            {"provider": "sqlite", "path": str(path)},
+            registry=registry,
+        )
+        event_store = create_event_store(
+            {"provider": "sqlite", "path": str(path)},
             registry=registry,
         )
 
-        self.assertIsInstance(store, InMemoryCheckpointStore)
-        self.assertEqual(created, ["db://workflow"])
+    assert isinstance(checkpoint_store, SQLiteCheckpointStore)
+    assert isinstance(event_store, SQLiteEventStore)
 
-    async def test_sqlite_store_providers_are_registered(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "workflow.sqlite"
-            checkpoint_store = create_checkpoint_store(
-                {"provider": "sqlite", "path": str(path)}
-            )
-            event_store = create_event_store(
-                {"provider": "sqlite", "path": str(path)}
-            )
+async def test_redis_checkpoint_store_resolves_action_with_fake_client():
+    client = FakeRedis()
+    store = RedisCheckpointStore(client=client, prefix="test")
+    run_state = RunState(
+        run_id="run_1",
+        workflow_id="wf",
+        workflow_version=1,
+        status="waiting_for_user",
+        waiting_action_id="pa_1",
+        current_node_id="confirm",
+        state={"nodes": {"confirm": {"status": "waiting"}}},
+    )
+    action = PendingAction(
+        id="pa_1",
+        run_id="run_1",
+        node_id="confirm",
+        action_type="human",
+        request={"response_schema": {"type": "object", "required": ["decision"]}},
+        expires_at_ms=None,
+    )
 
-        self.assertIsInstance(checkpoint_store, SQLiteCheckpointStore)
-        self.assertIsInstance(event_store, SQLiteEventStore)
+    await store.save_waiting(run_state, action)
+    resumed = await store.resolve_action("pa_1", {"decision": "approve"})
 
-    async def test_core_persistence_plugins_exclude_optional_sqlite_provider(self):
-        registry = core_persistence_plugins()
+    assert resumed.status == "running"
+    assert resumed.state["nodes"]["confirm"]["output"] == {"decision": "approve"}
+    assert (await store.load_action("pa_1")).status == "approved"
 
-        with self.assertRaisesRegex(WorkflowError, "store provider not registered: sqlite"):
-            create_checkpoint_store({"provider": "sqlite", "path": "/tmp/workflow.sqlite"}, registry=registry)
+async def test_redis_event_store_lists_and_replaces_events_with_fake_client():
+    client = FakeRedis()
+    store = RedisEventStore(client=client, prefix="test")
+    first = WorkflowEvent(type="run.started", run_id="run_1")
+    second = WorkflowEvent(type="run.finished", run_id="run_1")
 
-    async def test_sqlite_provider_can_be_registered_as_optional_store_plugin(self):
-        registry = register_sqlite_stores(core_persistence_plugins())
+    await store.append(first)
+    assert [event.type for event in await store.list_by_run("run_1")] == ["run.started"]
 
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "workflow.sqlite"
-            checkpoint_store = create_checkpoint_store(
-                {"provider": "sqlite", "path": str(path)},
-                registry=registry,
-            )
-            event_store = create_event_store(
-                {"provider": "sqlite", "path": str(path)},
-                registry=registry,
-            )
+    await store.replace_run("run_1", [second])
+    assert [event.type for event in await store.list_by_run("run_1")] == ["run.finished"]
 
-        self.assertIsInstance(checkpoint_store, SQLiteCheckpointStore)
-        self.assertIsInstance(event_store, SQLiteEventStore)
+async def test_redis_store_providers_can_be_registered():
+    registry = register_redis_stores(PersistencePluginRegistry())
+    client = FakeRedis()
 
-    async def test_redis_checkpoint_store_resolves_action_with_fake_client(self):
-        client = FakeRedis()
-        store = RedisCheckpointStore(client=client, prefix="test")
-        run_state = RunState(
-            run_id="run_1",
-            workflow_id="wf",
-            workflow_version=1,
-            status="waiting_for_user",
-            waiting_action_id="pa_1",
-            current_node_id="confirm",
-            state={"nodes": {"confirm": {"status": "waiting"}}},
-        )
-        action = PendingAction(
-            id="pa_1",
-            run_id="run_1",
-            node_id="confirm",
-            action_type="human",
-            request={"response_schema": {"type": "object", "required": ["decision"]}},
-            expires_at_ms=None,
-        )
+    checkpoint_store = registry.checkpoints.create(
+        {"provider": "redis", "prefix": "test", "client": client}
+    )
+    event_store = registry.events.create(
+        {"provider": "redis", "prefix": "test", "client": client}
+    )
 
-        await store.save_waiting(run_state, action)
-        resumed = await store.resolve_action("pa_1", {"decision": "approve"})
-
-        self.assertEqual(resumed.status, "running")
-        self.assertEqual(
-            resumed.state["nodes"]["confirm"]["output"],
-            {"decision": "approve"},
-        )
-        self.assertEqual((await store.load_action("pa_1")).status, "approved")
-
-    async def test_redis_event_store_lists_and_replaces_events_with_fake_client(self):
-        client = FakeRedis()
-        store = RedisEventStore(client=client, prefix="test")
-        first = WorkflowEvent(type="run.started", run_id="run_1")
-        second = WorkflowEvent(type="run.finished", run_id="run_1")
-
-        await store.append(first)
-        self.assertEqual([event.type for event in await store.list_by_run("run_1")], ["run.started"])
-
-        await store.replace_run("run_1", [second])
-        self.assertEqual([event.type for event in await store.list_by_run("run_1")], ["run.finished"])
-
-    async def test_redis_store_providers_can_be_registered(self):
-        registry = register_redis_stores(PersistencePluginRegistry())
-        client = FakeRedis()
-
-        checkpoint_store = registry.checkpoints.create(
-            {"provider": "redis", "prefix": "test", "client": client}
-        )
-        event_store = registry.events.create(
-            {"provider": "redis", "prefix": "test", "client": client}
-        )
-
-        self.assertIsInstance(checkpoint_store, RedisCheckpointStore)
-        self.assertIsInstance(event_store, RedisEventStore)
+    assert isinstance(checkpoint_store, RedisCheckpointStore)
+    assert isinstance(event_store, RedisEventStore)
 
 
 class FakePipeline:

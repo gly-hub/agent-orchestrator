@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from agent_orchestrator.models import RunState, ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 RiskLevel = Literal["low", "medium", "high"]
 ConfirmationPolicy = Literal["never", "always", "risk_based"]

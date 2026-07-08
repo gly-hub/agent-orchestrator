@@ -5,19 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_orchestrator.exceptions import WorkflowConfigError
-
-SUPPORTED_SCHEMA_KEYS = {
-    "type",
-    "enum",
-    "required",
-    "properties",
-    "additionalProperties",
-    "items",
-    "minLength",
-    "maxLength",
-    "minimum",
-    "maximum",
-}
+from agent_orchestrator.schema import SUPPORTED_SCHEMA_KEYS
 
 
 def validate_schema(node_id: str, schema_name: str, schema: Any) -> None:

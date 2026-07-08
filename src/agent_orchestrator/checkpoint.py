@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -16,6 +17,8 @@ from typing import Protocol
 from agent_orchestrator.exceptions import WorkflowError
 from agent_orchestrator.models import PendingAction, RunState
 from agent_orchestrator.schema import validate_schema_value
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointStore(Protocol):
@@ -102,6 +105,7 @@ class BaseCheckpointStore:
         if expired and action.request.get("on_timeout") is None:
             action.status = "expired"
             await self._save_action(action)
+            logger.info("pending action %s expired", pending_action_id)
             raise WorkflowError(f"pending action expired: {pending_action_id}")
         if expired:
             decision = self._resolve_timeout_decision(action, decision)
@@ -109,6 +113,7 @@ class BaseCheckpointStore:
             raise WorkflowError(f"pending action already resolved: {pending_action_id}")
         _validate_decision(action, decision)
         if not await self._mark_executed_once(pending_action_id):
+            logger.warning("duplicate resume attempt for action %s", pending_action_id)
             raise WorkflowError(f"pending action already resumed: {pending_action_id}")
 
         action.status = "approved" if decision.get("decision") == "approve" else "rejected"

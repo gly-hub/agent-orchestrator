@@ -33,7 +33,7 @@ aiohttp = ["aiohttp>=3.9.0"]
 claude = ["claude-agent-sdk>=0.2.101"]
 redis = ["redis>=5.0.0"]
 all = ["aiohttp>=3.9.0", "claude-agent-sdk>=0.2.101", "redis>=5.0.0"]
-dev = ["ruff>=0.6.0", "pyright>=1.1.370", "redis>=5.0.0"]
+dev = ["ruff>=0.6.0", "pyright>=1.1.370", "redis>=5.0.0", "pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
 
 [tool.setuptools.package-dir]
 "" = "src"
@@ -58,11 +58,12 @@ ignore = ["E501", "UP046"]
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [tool.pyright]
 include = ["src"]
 pythonVersion = "3.12"
-typeCheckingMode = "basic"
+typeCheckingMode = "standard"
 reportMissingTypeStubs = false
-reportUnknownMemberType = false
-reportUnknownVariableType = false
-reportUnknownArgumentType = false
+reportIncompatibleVariableOverride = false

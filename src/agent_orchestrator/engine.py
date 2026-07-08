@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -12,6 +13,7 @@ from agent_orchestrator.engine_runtime import EngineRuntimeMixin
 from agent_orchestrator.events import EventStore, NoopEventStore
 from agent_orchestrator.exceptions import WaitingForUser
 from agent_orchestrator.execution import WorkflowExecutionContext
+from agent_orchestrator.loop import LoopNodeExecutorMixin
 from agent_orchestrator.models import (
     PendingAction,
     ResumeRunRequest,
@@ -30,6 +32,8 @@ from agent_orchestrator.router import WorkflowRouter
 from agent_orchestrator.subflow import SubflowNodeExecutorMixin
 from agent_orchestrator.validation import validate_workflow_config
 
+logger = logging.getLogger(__name__)
+
 EngineErrorObserver = Callable[[Exception, RunState], Awaitable[None] | None]
 
 
@@ -38,6 +42,7 @@ class WorkflowEngine(
     BasicNodeExecutorMixin,
     ParallelNodeExecutorMixin,
     SubflowNodeExecutorMixin,
+    LoopNodeExecutorMixin,
 ):
     """Execute configured workflows and stream normalized events.
 
@@ -90,6 +95,7 @@ class WorkflowEngine(
 
     async def start(self, request: StartRunRequest) -> AsyncIterator[WorkflowEvent]:
         run_state = self._new_run_state(request)
+        logger.info("run %s starting workflow %s", run_state.run_id, self.workflow.id)
         async for event in self._advance_public_run(run_state, initial_event_type="run.started"):
             yield event
 
@@ -106,6 +112,7 @@ class WorkflowEngine(
         if not pending_action_id or decision is None:
             raise ValueError("pending_action_id and decision are required")
 
+        logger.info("resuming pending action %s", pending_action_id)
         run_state = await self.checkpoints.resolve_action(pending_action_id, decision)
         async for event in self._advance_public_run(
             run_state,
@@ -219,10 +226,12 @@ class WorkflowEngine(
                 node_id = self._router.next_node_id(run_state)
 
             run_state.status = "completed"
+            logger.info("run %s completed", run_state.run_id)
             yield await self._event("run.finished", run_state)
         except WaitingForUser as exc:
             run_state.status = "waiting_for_user"
             run_state.waiting_action_id = exc.pending_action_id
+            logger.info("run %s waiting for user action %s", run_state.run_id, exc.pending_action_id)
             await self.execution.observe(
                 "run.waiting",
                 run_state,
@@ -237,6 +246,7 @@ class WorkflowEngine(
             )
         except Exception as exc:
             run_state.status = "failed"
+            logger.error("run %s failed at node %s: %s", run_state.run_id, run_state.current_node_id, exc)
             await self._observe_run_failed(exc, run_state)
             yield await self._run_failed_event(
                 run_state,
@@ -355,6 +365,10 @@ class WorkflowEngine(
             return
         if node_type == "subflow":
             async for event in self._run_subflow_node(node, run_state):
+                yield event
+            return
+        if node_type == "loop":
+            async for event in self._run_loop_node(node, run_state):
                 yield event
             return
         raise ValueError(f"unsupported node type: {node_type}")

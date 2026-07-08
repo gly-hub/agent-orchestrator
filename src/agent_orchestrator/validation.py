@@ -12,7 +12,7 @@ from agent_orchestrator.validation_graph import (
 )
 from agent_orchestrator.validation_schema import validate_schema
 
-SUPPORTED_NODE_TYPES = {"agent", "tool", "transform", "human", "condition", "parallel", "subflow"}
+SUPPORTED_NODE_TYPES = {"agent", "tool", "transform", "human", "condition", "parallel", "subflow", "loop"}
 REQUIRED_FIELDS_BY_TYPE = {
     "agent": {"agent"},
     "tool": {"tool"},
@@ -21,6 +21,7 @@ REQUIRED_FIELDS_BY_TYPE = {
     "condition": set(),
     "parallel": set(),
     "subflow": {"workflow"},
+    "loop": {"body"},
 }
 
 
@@ -158,8 +159,6 @@ def _validate_node_options(node_id: str, node: dict[str, Any]) -> None:
                 _validate_parallel_workflow_branch(node_id, branch_id, branch)
                 continue
             branch_type = branch.get("type")
-            if branch_type == "human":
-                raise WorkflowConfigError(f"node {node_id} branch {branch_id} cannot be a human node")
             if branch_type == "parallel":
                 raise WorkflowConfigError(f"node {node_id} branch {branch_id} cannot be a nested parallel node")
             if branch_type not in SUPPORTED_NODE_TYPES:
@@ -188,13 +187,33 @@ def _validate_node_options(node_id: str, node: dict[str, Any]) -> None:
             policy=dict(workflow.get("policy", {})),
         )
         validate_workflow_config(child_config)
-        if _workflow_contains_node_type(child_config.nodes, "human"):
-            raise WorkflowConfigError(f"node {node_id} workflow cannot contain human nodes")
 
     if node.get("type") == "human":
         response_schema = node.get("response_schema")
         if response_schema is not None:
             validate_schema(node_id, "response_schema", response_schema)
+
+    if node.get("type") == "loop":
+        body = node.get("body")
+        if not isinstance(body, dict):
+            raise WorkflowConfigError(f"node {node_id} body must be a mapping")
+        if "nodes" not in body:
+            raise WorkflowConfigError(f"node {node_id} body must contain nodes")
+        max_iterations = node.get("max_iterations")
+        if max_iterations is not None and (not isinstance(max_iterations, int) or max_iterations < 1):
+            raise WorkflowConfigError(f"node {node_id} max_iterations must be >= 1")
+        condition = node.get("condition")
+        if condition is not None:
+            validate_when_expression(node_id, condition)
+        child_config = _InlineWorkflowConfig(
+            id=str(body.get("id", f"{node_id}.body")),
+            nodes=list(body.get("nodes", [])),
+            edges=list(body.get("edges", [])),
+            policy=dict(body.get("policy", {})),
+        )
+        validate_workflow_config(child_config)
+        if _workflow_contains_node_type(child_config.nodes, "human"):
+            raise WorkflowConfigError(f"node {node_id} body cannot contain human nodes")
 
     for schema_field in ("input_schema", "output_schema"):
         schema = node.get(schema_field)
@@ -219,8 +238,6 @@ def _validate_parallel_workflow_branch(
         policy=dict(workflow.get("policy", {})),
     )
     validate_workflow_config(child_config)
-    if _workflow_contains_node_type(child_config.nodes, "human"):
-        raise WorkflowConfigError(f"node {node_id} branch {branch_id} workflow cannot contain human nodes")
 
 
 def _validate_policy(policy: Any) -> None:
@@ -271,5 +288,9 @@ def _workflow_contains_node_type(nodes: list[dict[str, Any]], node_type: str) ->
         if node.get("type") == "subflow":
             workflow = node.get("workflow", {})
             if isinstance(workflow, dict) and _workflow_contains_node_type(list(workflow.get("nodes", [])), node_type):
+                return True
+        if node.get("type") == "loop":
+            body = node.get("body", {})
+            if isinstance(body, dict) and _workflow_contains_node_type(list(body.get("nodes", [])), node_type):
                 return True
     return False

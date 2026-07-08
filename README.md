@@ -2,26 +2,114 @@
 
 Composable Agent Workflow Engine with resumable human checkpoints.
 
+```
+pip install dandelion-orchestrator
+```
+
+## Quick Start
+
+```python
+import asyncio
+from agent_orchestrator import (
+    AgentRegistry, StartRunRequest, ToolRegistry,
+    WorkflowConfig, WorkflowEngine, WorkflowEvent,
+)
+
+async def main():
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+
+    async def greet_agent(agent_input, run_state):
+        yield WorkflowEvent(
+            type="agent.output",
+            run_id=run_state.run_id,
+            node_id="greet",
+            data={"greeting": f"Hello, {agent_input['name']}!"},
+        )
+
+    agents.register("greeter", greet_agent)
+
+    workflow = WorkflowConfig.from_dict({
+        "id": "hello-world", "version": 1,
+        "nodes": [
+            {"id": "greet", "type": "agent", "agent": "greeter",
+             "input": {"name": "{{context.user_name}}"}},
+        ],
+    })
+
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools)
+    async for event in engine.start(
+        StartRunRequest(message="hi", context={"user_name": "Ada"})
+    ):
+        print(event.type, event.data)
+
+asyncio.run(main())
+```
+
+## Architecture
+
+```
+                        ┌──────────────────────┐
+                        │    WorkflowEngine     │
+                        │  (start / resume)     │
+                        └──────────┬───────────┘
+                                   │
+               ┌───────────────────┼───────────────────┐
+               │                   │                   │
+        ┌──────▼──────┐    ┌──────▼──────┐    ┌───────▼──────┐
+        │   Router     │    │  Executors   │    │   Stores     │
+        │  edges/when  │    │  agent/tool  │    │  checkpoint  │
+        │  conditions  │    │  transform   │    │  event       │
+        │              │    │  human/cond  │    │  artifact    │
+        │              │    │  parallel    │    │              │
+        │              │    │  subflow     │    │              │
+        │              │    │  loop        │    │              │
+        └──────────────┘    └─────────────┘    └──────────────┘
+```
+
+The engine drives a run through its workflow graph. The **router** picks the next
+node based on edges and `when` conditions. **Executors** run each node type.
+**Stores** persist checkpoint state, events, and artifacts.
+
+## Core Concepts
+
+**WorkflowConfig** — a validated DAG of nodes and edges, created from a dict.
+Nodes have types (`agent`, `tool`, `transform`, `human`, `condition`, `parallel`,
+`subflow`, `loop`) and connect via edges with optional `when` conditions.
+
+**RunState** — the mutable state of a single workflow execution. Holds node
+outputs, context, status, and the current position in the graph.
+
+**Templates** — `{{path.to.value}}` expressions resolve dotted paths from run
+state. Supports `| default(fallback)` filters. When a whole string is a single
+template, the original value type is preserved.
+
+**Human Checkpoints** — `human` nodes pause the run and emit `human.required`.
+The client stores the `pending_action_id`, collects user input, and calls
+`engine.resume(...)` to continue. Human nodes work at top level, inside
+`subflow` nodes, and inside `parallel` branches (sequential fallback).
+
+**Events** — every lifecycle step emits a `WorkflowEvent`. Events power
+streaming, replay, and compaction.
+
 ## Features
 
-- Workflow nodes: `agent`, `tool`, `transform`, `human`, `condition`, `parallel`, `subflow`
+- 8 node types: `agent`, `tool`, `transform`, `human`, `condition`, `parallel`, `subflow`, `loop`
 - Shared state with `{{path.to.value}}` template resolution and `| default(...)`
-- Workflow config validation
-- Human checkpoint and resume flow
-- Human response schema validation for structured user input
-- Tool confirmation before side effects
-- Tool input/output schema validation
-- Agent output schema validation
-- Workflow and node-level tool policy controls
-- Tool permission, risk, confirmation, and audit decision events
-- Node retry policy and node duration metadata
-- Pluggable checkpoint and event stores
-- Pluggable artifact stores for large node outputs
-- Replayable run/event compaction
-- In-memory, file-based, and SQLite built-in stores
+- Condition expressions: `==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`, `and`, `or`, parentheses
+- Human checkpoint and resume flow with response schema validation
+- Human nodes in parallel branches (sequential fallback) and subflow nodes
+- Loop nodes with condition-based exit and max iteration caps
+- Tool confirmation, permissions, risk levels, and policy decisions
+- Tool and agent input/output schema validation
+- Node retry with exponential backoff and error edges
+- Pluggable checkpoint, event, and artifact stores
+- Built-in stores: in-memory, file, SQLite, Redis
+- Replayable event compaction
+- Event schema versioning with migration registry
 - Message/SSE event adapter for stream continuity
 - Optional Claude Agent SDK runner
-- Framework-independent core
+- Framework-independent core, zero required dependencies
 
 ## Run Tests
 
@@ -29,10 +117,10 @@ Composable Agent Workflow Engine with resumable human checkpoints.
 make check
 ```
 
-Or run the unittest suite directly:
+Or run tests directly:
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -p "test*.py"
+PYTHONPATH=src python3 -m pytest tests/
 ```
 
 ## Run Examples
@@ -47,9 +135,10 @@ PYTHONPATH=src python3 examples/aiohttp_orchestrator_server.py
 ## Workflow Language Boundaries
 
 The workflow language is intentionally small: templates resolve dotted state
-paths, `when` supports simple comparisons plus `and`/`or`, and schemas use a
-JSON-Schema-like subset. See [docs/workflow_language.md](docs/workflow_language.md)
-for the exact supported surface.
+paths, `when` supports simple comparisons plus `and`/`or` with parentheses for
+grouping, and schemas use a JSON-Schema-like subset. See
+[docs/workflow_language.md](docs/workflow_language.md) for the exact supported
+surface.
 
 ## Public API
 
@@ -71,290 +160,9 @@ Use `WorkflowEngine.start(...)` for the first stream. When a `human.required`
 event is emitted, persist `pending_action_id` in the client. After user
 confirmation, call `WorkflowEngine.resume(...)` and continue streaming.
 
-## Persistent Checkpoints
+## Node Types
 
-Use `FileCheckpointStore` for local services or integration tests that need to
-resume across engine instances:
-
-```python
-from agent_orchestrator import FileCheckpointStore, WorkflowEngine
-
-engine = WorkflowEngine(
-    workflow,
-    agents=agents,
-    tools=tools,
-    checkpoints=FileCheckpointStore("/tmp/agent-orchestrator-checkpoints"),
-    pending_action_ttl_ms=600_000,
-)
-```
-
-`FileCheckpointStore` persists waiting run state and pending actions as JSON
-files, and uses an execution lock file to reject duplicate resume attempts.
-
-### Persistence Production Guidance
-
-The built-in stores are intentionally small and dependency-light, but they have
-different operational envelopes:
-
-- `memory`: tests, examples, and single-process demos only. Data is lost on
-  process restart and cannot coordinate multiple workers.
-- `file`: local development, integration tests, or simple single-host services.
-  It uses atomic file replacement for JSON payloads and lock files for duplicate
-  resume protection, but it is not a transactional multi-worker store.
-- `sqlite`: small deployments, local services, and embedded use cases. It
-  provides transactional resume handling and ordered event logs without external
-  infrastructure, but it is still a single-file database.
-- `redis` or a custom database-backed plugin: recommended for multi-instance
-  services, distributed workers, stronger operational controls, and production
-  workloads that need shared checkpoint state.
-
-For a no-dependency SQL option, use SQLite stores. They use Python's standard
-library `sqlite3` module, so the core package still has no external persistence
-dependency:
-
-```python
-from agent_orchestrator import SQLiteCheckpointStore, SQLiteEventStore, WorkflowEngine
-
-engine = WorkflowEngine(
-    workflow,
-    agents=agents,
-    tools=tools,
-    checkpoints=SQLiteCheckpointStore("/tmp/agent-orchestrator.sqlite"),
-    event_store=SQLiteEventStore("/tmp/agent-orchestrator.sqlite"),
-)
-```
-
-`SQLiteCheckpointStore` persists waiting run state, pending actions, action
-expiry timestamps, and an idempotency table used to reject duplicate resume
-attempts. `SQLiteEventStore` stores workflow events in append order for audit
-and replay.
-
-### Execution Leases and Event Consistency
-
-`WorkflowEngine.start(...)` and `WorkflowEngine.resume(...)` hold a run-level
-execution lease while advancing a run. Built-in checkpoint stores implement the
-lease with process memory, local files, SQLite transactions, or Redis `SET NX`
-locks depending on the provider. The lease prevents two workers from advancing
-the same run at the same time; set `run_lease_ttl_ms=None` only for tests or
-single-process demos that explicitly do not need this guard.
-
-Run state remains the source of truth for live execution. Event stores are an
-append-only audit and replay log. If appending an event fails, the engine marks
-the run failed and still returns an unpersisted `run.failed` event to the caller
-so streaming clients receive a terminal state. Applications that require
-stronger guarantees should use a transactional checkpoint/event store pair or
-replay from the event log as their own source of truth.
-
-## Persistence Plugins
-
-Persistence is intentionally interface-based. Applications can pass store
-instances directly:
-
-```python
-engine = WorkflowEngine(
-    workflow,
-    agents=agents,
-    tools=tools,
-    checkpoints=my_checkpoint_store,
-    event_store=my_event_store,
-)
-```
-
-To make persistence configurable, register provider factories:
-
-```python
-from agent_orchestrator import PersistencePluginRegistry, create_checkpoint_store
-
-plugins = PersistencePluginRegistry()
-plugins.checkpoints.register(
-    "postgres",
-    lambda config: PostgresCheckpointStore(config["dsn"]),
-)
-
-checkpoints = create_checkpoint_store(
-    {"provider": "postgres", "dsn": "postgresql://..."},
-    registry=plugins,
-)
-```
-
-Custom checkpoint stores implement:
-
-```python
-class CheckpointStore:
-    async def save_waiting(self, run_state, action) -> None: ...
-    async def load_run(self, run_id): ...
-    async def load_action(self, pending_action_id): ...
-    async def resolve_action(self, pending_action_id, decision): ...
-```
-
-If your store inherits `BaseCheckpointStore`, you only need to implement the
-storage primitives and can reuse TTL, decision validation, and duplicate-resume
-logic:
-
-```python
-class MyCheckpointStore(BaseCheckpointStore):
-    async def save_waiting(self, run_state, action) -> None: ...
-    async def load_run(self, run_id): ...
-    async def load_action(self, pending_action_id): ...
-    async def _save_action(self, action) -> None: ...
-    async def _mark_executed_once(self, pending_action_id) -> bool: ...
-```
-
-Event stores are optional and default to `NoopEventStore`. They can be used for
-audit and replay:
-
-```python
-class EventStore:
-    async def append(self, event) -> None: ...
-    async def list_by_run(self, run_id): ...
-```
-
-Built-in providers:
-
-- checkpoint stores: `memory`, `file`, `sqlite`, `redis`
-- event stores: `noop`, `memory`, `file`, `sqlite`, `redis`
-- artifact stores: `memory`, `file`
-
-SQLite providers accept `path`:
-
-```python
-from agent_orchestrator import create_checkpoint_store, create_event_store
-
-checkpoints = create_checkpoint_store(
-    {"provider": "sqlite", "path": "/tmp/agent-orchestrator.sqlite"}
-)
-events = create_event_store(
-    {"provider": "sqlite", "path": "/tmp/agent-orchestrator.sqlite"}
-)
-```
-
-For plugin-style packaging, build a core registry and register optional stores
-explicitly:
-
-```python
-from agent_orchestrator import (
-    core_persistence_plugins,
-    create_checkpoint_store,
-    create_event_store,
-    register_sqlite_stores,
-)
-
-plugins = register_sqlite_stores(core_persistence_plugins())
-
-checkpoints = create_checkpoint_store(
-    {"provider": "sqlite", "path": "/tmp/agent-orchestrator.sqlite"},
-    registry=plugins,
-)
-events = create_event_store(
-    {"provider": "sqlite", "path": "/tmp/agent-orchestrator.sqlite"},
-    registry=plugins,
-)
-```
-
-The default registry keeps `sqlite` registered for backward compatibility. New
-optional stores such as Postgres should follow the same shape:
-`register_<provider>_stores(registry)`.
-
-Redis providers accept `url`, `prefix`, and optional retention knobs. Install
-the optional dependency before using them:
-
-```bash
-pip install "dandelion-orchestrator[redis]"
-```
-
-```python
-from agent_orchestrator import create_checkpoint_store, create_event_store
-
-checkpoints = create_checkpoint_store(
-    {"provider": "redis", "url": "redis://localhost:6379/0", "prefix": "prod"}
-)
-events = create_event_store(
-    {
-        "provider": "redis",
-        "url": "redis://localhost:6379/0",
-        "prefix": "prod",
-        "max_events_per_run": 10_000,
-    }
-)
-```
-
-## Event Replay
-
-Persisted events can be replayed into a compact run view:
-
-```python
-from agent_orchestrator import replay_run
-
-replay = await replay_run(event_store, run_id)
-
-print(replay.status)
-print(replay.nodes["deploy"]["output"])
-print(replay.message_events)
-```
-
-`replay.workflow_events` preserves internal events, while
-`replay.message_events` contains the chat/SSE-friendly envelopes produced by
-`to_message_event(...)`.
-
-Workflow events include a `schema_version` field. Built-in event stores read
-older persisted events that do not have this field as version `1`, so existing
-logs remain replayable after upgrading.
-
-## Event Compaction
-
-Long event logs can be compacted into a replayable `run.compacted` snapshot plus
-an optional tail of recent events:
-
-```python
-from agent_orchestrator import compact_run, replay_run
-
-result = await compact_run(event_store, run_id, retain_last=20)
-replay = await replay_run(event_store, run_id)
-
-print(result.original_event_count)
-print(result.compacted_event_count)
-print(replay.status)
-```
-
-`compact_events(...)` is the pure in-memory helper for event lists.
-`compact_run(...)` loads a run from an event store, writes back the compacted
-event list with `replace_run(...)`, and remains replay-compatible.
-
-Built-in event stores support replacement:
-
-- `InMemoryEventStore`
-- `FileEventStore`
-- `SQLiteEventStore`
-
-Custom stores that support compaction should implement `CompactableEventStore`.
-Stores that only append and list events can implement the smaller `EventStore`
-interface.
-
-The compaction snapshot stores the materialized run view used by replay:
-status, node records, message ids, waiting action id, and run error. Retained
-tail events are applied after the snapshot, so clients can keep recent detailed
-events while shrinking older history.
-
-## Config Validation
-
-`WorkflowConfig.from_dict(...)` validates workflow structure by default:
-
-- node ids must be unique
-- node types must be supported
-- `agent` nodes must declare `agent`
-- `tool` nodes must declare `tool`
-- `condition` node cases must declare `when` and `value`
-- `parallel` nodes must declare non-empty `branches`
-- `parallel` branches cannot contain `human` nodes
-- `subflow` nodes must declare an inline `workflow`
-- `subflow` workflows cannot contain `human` nodes
-- edge endpoints must reference existing nodes
-- obvious graph cycles are rejected
-
-Manual configs are also validated by `WorkflowEngine(...)` during
-initialization.
-
-## Data Binding
+### Data Binding
 
 Nodes read from shared run state with template expressions:
 
@@ -374,7 +182,7 @@ Nodes read from shared run state with template expressions:
 When the whole string is a template, the original value type is preserved. Inline
 templates are converted to strings.
 
-## Condition Nodes
+### Condition Nodes
 
 Use a `condition` node when a routing decision should be visible in run state:
 
@@ -407,12 +215,13 @@ Condition expressions support a safe subset without `eval`:
 {{context.level}} not in ['guest', 'normal']
 {{context.score}} >= 90 and {{context.level}} == 'vip'
 {{context.score}} < 60 or {{context.level}} == 'guest'
+({{context.a}} == 1 or {{context.b}} == 2) and {{context.c}} == 3
 ```
 
 Supported operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`,
-`and`, and `or`.
+`and`, `or`. Parentheses are supported for grouping.
 
-## Parallel Nodes
+### Parallel Nodes
 
 Use a `parallel` node to fan out independent work and merge the branch outputs
 before the workflow continues:
@@ -494,13 +303,11 @@ Supported failure policies:
 - `fail`: default; any failed branch fails the parallel node
 - `continue`: preserve failed branch output and continue the workflow
 
-`human` nodes are intentionally rejected inside parallel branches. A parallel
-branch is a nested execution scope; checkpointing user waits there would require
-a multi-action or nested-continuation resume contract. Use `human` before or
-after the `parallel` node, or route through ordinary condition/edge branches
-when user confirmation is required.
+Branches containing `human` nodes automatically fall back to sequential execution.
+When a sequential branch hits a human checkpoint, the parallel node pauses the
+entire run. On resume, the branch completes and remaining branches execute.
 
-## Subflow Nodes
+### Subflow Nodes
 
 Use a `subflow` node to package a reusable workflow fragment behind one parent
 node:
@@ -537,27 +344,47 @@ merged back with namespaced ids such as `profile_flow.lookup`.
 
 By default, the subflow node exposes the last child node output. Declare
 `output` on the subflow node to select a stable contract from the child state.
-The parent node output shape is:
-
-```python
-{
-    "workflow_id": "profile-lookup",
-    "status": "completed",
-    "nodes": {"profile_flow.lookup": {...}},
-    "output": {"level": "vip"},
-}
-```
 
 Child events are emitted as namespaced subflow events, for example
 `subflow.node.started`, with `subflow_node_id` and `subflow_event_type` in the
 event data.
 
-`human` nodes are intentionally rejected inside subflows. A subflow is a nested
-execution scope; waiting inside it would require persisting and resuming the
-child run state separately from the parent node. Use `human` in the parent
-workflow before or after the `subflow` node.
+`human` nodes inside subflows pause the parent run. On resume, the child
+workflow continues from where it left off.
 
-## Human Forms
+### Loop Nodes
+
+Use a `loop` node to repeat a body workflow while a condition holds:
+
+```python
+{
+    "id": "retry_until_done",
+    "type": "loop",
+    "condition": "{{nodes.retry_until_done.output.last_output.status}} != 'done'",
+    "max_iterations": 10,
+    "body": {
+        "nodes": [
+            {"id": "check", "type": "tool", "tool": "check_status"},
+        ],
+    },
+}
+```
+
+The condition is evaluated before each iteration (after the first). If omitted,
+the loop runs for exactly `max_iterations` (default: 100). The loop node output
+is:
+
+```python
+{
+    "iterations": 3,
+    "outputs": [{"status": "pending"}, {"status": "pending"}, {"status": "done"}],
+    "last_output": {"status": "done"},
+}
+```
+
+Body node events are namespaced as `loop_id.iteration_N.child_node`.
+
+### Human Forms
 
 `human` nodes can describe fields and validate the resume payload with a small
 JSON-schema-like `response_schema`:
@@ -592,12 +419,6 @@ async for event in engine.resume(
     ...
 ```
 
-Supported field types in `response_schema.properties.*.type` are `string`,
-`number`, `integer`, `boolean`, `object`, and `array`.
-
-The same schema subset supports `enum`, `required`, `items`, `minLength`,
-`maxLength`, `minimum`, `maximum`, and `additionalProperties`.
-
 Human and tool-confirmation pending actions can provide a default timeout
 decision:
 
@@ -611,18 +432,12 @@ decision:
 ```
 
 If the pending action has expired when `resume(...)` is called, this decision is
-used instead of the submitted payload. Without `on_timeout`, expired actions are
-rejected with an error.
-
-Services can proactively scan and resume expired pending actions:
+used instead of the submitted payload. Services can proactively scan and resume
+expired pending actions:
 
 ```python
 events = await engine.resume_expired_actions()
 ```
-
-Actions with `on_timeout` resume through the normal workflow path using the
-timeout decision. Actions without `on_timeout` are marked expired and emit a
-`human.expired` event.
 
 ## Node Retry and Observability
 
@@ -656,16 +471,6 @@ Terminal node failures can branch through `on_error` edges:
 ]
 ```
 
-When a node uses an error edge, the run continues and the failed node output is:
-
-```json
-{
-  "failed": true,
-  "error": "...",
-  "error_type": "TimeoutError"
-}
-```
-
 ## Tool Policy
 
 Tools can declare permissions, risk level, and confirmation policy:
@@ -695,8 +500,6 @@ Supported confirmation policies:
 - `always`: always create a pending action before execution
 - `risk_based`: require confirmation when `risk_level == "high"`
 
-`requires_confirmation=True` remains supported and maps to `always`.
-
 Workflows can restrict which tools are callable:
 
 ```python
@@ -710,23 +513,8 @@ workflow = WorkflowConfig.from_dict(
 )
 ```
 
-Tool nodes can override permissions and confirmation policy for that specific
-call site:
-
-```python
-{
-    "id": "deploy_staging",
-    "type": "tool",
-    "tool": "deploy",
-    "permissions": ["deploy:staging"],
-    "confirmation_policy": "always",
-}
-```
-
 Every tool policy evaluation emits a `policy.decision` event before execution,
-confirmation, or denial. The event includes the decision, reason, required
-permissions, risk level, and confirmation policy. In SSE/message adapters it is
-mapped to `POLICY_DECISION`.
+confirmation, or denial.
 
 ## Tool Schemas
 
@@ -742,59 +530,24 @@ tools.register(
         "properties": {
             "env": {"type": "string", "enum": ["staging", "prod"]},
             "version": {"type": "string", "minLength": 5},
-            "replicas": {"type": "integer", "minimum": 1, "maximum": 5},
         },
-        "additionalProperties": False,
     },
     output_schema={
         "type": "object",
         "required": ["deployment_id"],
         "properties": {
             "deployment_id": {"type": "string", "maxLength": 64},
-            "ok": {"type": "boolean"},
         },
-        "additionalProperties": False,
     },
 )
 ```
 
-Nodes can override the registered tool schemas with `input_schema` or
-`output_schema` when a specific workflow needs a narrower contract.
-
-Supported schema keywords:
-
-- `type`: `string`, `number`, `integer`, `boolean`, `object`, `array`, `null`
-- `enum`
-- `required`
-- `properties`
-- `items`
-- `minLength`, `maxLength`
-- `minimum`, `maximum`
-- `additionalProperties`: `false` rejects unknown object fields; a schema value
-  validates each unknown field
-
-Agent nodes can also validate their final output:
-
-```python
-{
-    "id": "planner",
-    "type": "agent",
-    "agent": "planner",
-    "output_schema": {
-        "type": "object",
-        "required": ["requires_confirmation"],
-        "properties": {
-            "requires_confirmation": {"type": "boolean"},
-            "tools": {"type": "array", "items": {"type": "string"}},
-        },
-    },
-}
-```
+Supported schema keywords: `type`, `enum`, `required`, `properties`, `items`,
+`minLength`, `maxLength`, `minimum`, `maximum`, `additionalProperties`.
 
 ## Artifact Outputs
 
-Large node outputs can be moved out of run state and stored as artifacts. This is
-opt-in per node:
+Large node outputs can be stored as artifacts. Opt-in per node:
 
 ```python
 {
@@ -809,27 +562,10 @@ Or threshold-based:
 
 ```python
 engine = WorkflowEngine(
-    workflow,
-    agents=agents,
-    tools=tools,
-    artifact_store=FileArtifactStore("/tmp/agent-orchestrator-artifacts"),
+    workflow, agents=agents, tools=tools,
+    artifact_store=FileArtifactStore("/tmp/artifacts"),
     artifact_threshold_bytes=64_000,
 )
-```
-
-When a node output is stored as an artifact, `nodes.<id>.output` becomes:
-
-```json
-{
-  "artifact_ref": {
-    "artifact_id": "art_...",
-    "run_id": "run_...",
-    "node_id": "summarize_documents",
-    "name": "output",
-    "store": "file",
-    "uri": "/tmp/agent-orchestrator-artifacts/art_....json"
-  }
-}
 ```
 
 Use `resolve_artifacts(...)` to recursively replace artifact refs with their
@@ -841,30 +577,102 @@ from agent_orchestrator import resolve_artifacts
 value = await resolve_artifacts({"document": artifact_output}, artifact_store)
 ```
 
-Nodes can opt into automatic input artifact resolution before calling their
-agent/tool/transform logic:
+## Persistent Checkpoints
+
+Use `FileCheckpointStore` for local services or integration tests that need to
+resume across engine instances:
 
 ```python
-{
-    "id": "consumer",
-    "type": "tool",
-    "tool": "consume_document",
-    "resolve_input_artifacts": True,
-    "args": {
-        "document": "{{nodes.producer.output}}"
-    },
-}
+from agent_orchestrator import FileCheckpointStore, WorkflowEngine
+
+engine = WorkflowEngine(
+    workflow, agents=agents, tools=tools,
+    checkpoints=FileCheckpointStore("/tmp/checkpoints"),
+    pending_action_ttl_ms=600_000,
+)
 ```
+
+### Store Options
+
+| Store | Use Case | Dependencies |
+|-------|----------|-------------|
+| `InMemoryCheckpointStore` | Tests, single-process demos | None |
+| `FileCheckpointStore` | Local dev, integration tests | None |
+| `SQLiteCheckpointStore` | Small deployments, embedded | None (stdlib) |
+| `RedisCheckpointStore` | Multi-instance production | `redis>=5.0.0` |
+
+Event and artifact stores follow the same pattern. Install optional dependencies:
+
+```bash
+pip install "dandelion-orchestrator[redis]"   # Redis stores
+pip install "dandelion-orchestrator[all]"     # All optional deps
+```
+
+### Execution Leases
+
+`start(...)` and `resume(...)` hold a run-level execution lease. The lease
+prevents two workers from advancing the same run at the same time. Built-in
+stores implement leases with process memory, lock files, SQLite transactions,
+or Redis `SET NX`.
+
+## Persistence Plugins
+
+Persistence is interface-based. Register custom provider factories:
+
+```python
+from agent_orchestrator import PersistencePluginRegistry, create_checkpoint_store
+
+plugins = PersistencePluginRegistry()
+plugins.checkpoints.register(
+    "postgres",
+    lambda config: PostgresCheckpointStore(config["dsn"]),
+)
+
+checkpoints = create_checkpoint_store(
+    {"provider": "postgres", "dsn": "postgresql://..."},
+    registry=plugins,
+)
+```
+
+Custom checkpoint stores implement:
+
+```python
+class CheckpointStore:
+    async def save_waiting(self, run_state, action) -> None: ...
+    async def load_run(self, run_id): ...
+    async def load_action(self, pending_action_id): ...
+    async def resolve_action(self, pending_action_id, decision): ...
+```
+
+## Event Replay and Compaction
+
+Persisted events can be replayed into a compact run view:
+
+```python
+from agent_orchestrator import replay_run
+
+replay = await replay_run(event_store, run_id)
+print(replay.status, replay.nodes["deploy"]["output"])
+```
+
+Long event logs can be compacted:
+
+```python
+from agent_orchestrator import compact_run
+
+result = await compact_run(event_store, run_id, retain_last=20)
+```
+
+Workflow events include a `schema_version` field. Use `EventMigrationRegistry`
+to register migrations for upgrading persisted events across versions.
 
 ## Claude Agent SDK Runner
 
-Install the optional dependency when using the Claude runner:
+Install the optional dependency:
 
 ```bash
 pip install 'dandelion-orchestrator[claude]'
 ```
-
-Register the runner like any other agent handler:
 
 ```python
 from agent_orchestrator import AgentRegistry
@@ -876,21 +684,31 @@ agents.register(
     ClaudeAgentRunner(
         ClaudeAgentRunnerConfig(
             options={
-                "cwd": "/path/to/project",
                 "model": "claude-sonnet-4-5",
                 "system_prompt": "You are a senior engineer.",
                 "allowed_tools": ["Read", "Edit"],
-                "include_partial_messages": True,
             },
-            prompt_template="{message}",
+            prompt_template="$message",
         )
     ),
 )
 ```
 
-The runner maps SDK messages to workflow events:
+The runner maps SDK messages to workflow events: `TextBlock` -> `agent.delta`,
+`ToolUseBlock` -> `agent.tool_use`, `ToolResultBlock` -> `agent.tool_result`,
+final collected text -> `agent.output`.
 
-- `TextBlock` -> `agent.delta`
-- `ToolUseBlock` -> `agent.tool_use`
-- `ToolResultBlock` -> `agent.tool_result`
-- final collected text -> `agent.output`
+## Config Validation
+
+`WorkflowConfig.from_dict(...)` validates workflow structure:
+
+- Node ids must be unique
+- Node types must be supported
+- `agent` nodes must declare `agent`, `tool` nodes must declare `tool`
+- `condition` cases must declare `when` and `value`
+- `parallel` branches must be non-empty
+- `subflow` and `loop` nodes must declare valid body/workflow
+- `loop` nodes must have `max_iterations >= 1`
+- Edge endpoints must reference existing nodes
+- Graph cycles are rejected
+- `human` nodes are rejected inside `loop` bodies

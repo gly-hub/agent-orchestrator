@@ -12,4 +12,4 @@ typecheck:
 	python3 -m pyright src
 
 test:
-	PYTHONPATH=src python3 -m unittest discover -s tests -p "test*.py"
+	PYTHONPATH=src python3 -m pytest tests/

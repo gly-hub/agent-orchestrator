@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from copy import deepcopy
@@ -13,6 +14,8 @@ from agent_orchestrator.exceptions import PermissionDenied
 from agent_orchestrator.models import PendingAction, RunState, ToolDefinition, WorkflowEvent
 from agent_orchestrator.schema import validate_schema_value
 from agent_orchestrator.state import evaluate_when, render_template
+
+logger = logging.getLogger(__name__)
 
 
 class BasicNodeExecutorMixin:
@@ -25,6 +28,7 @@ class BasicNodeExecutorMixin:
     ) -> AsyncIterator[WorkflowEvent]:
         agent_name = render_template(node["agent"], run_state.state)
         agent = self.agents.get(agent_name)
+        logger.debug("executing agent node %s with agent %s", node["id"], agent_name)
         agent_input = await self._render_node_value(node, run_state, node.get("input", {}))
         text_parts: list[str] = []
         output: dict[str, Any] | None = None
@@ -54,6 +58,7 @@ class BasicNodeExecutorMixin:
     ) -> AsyncIterator[WorkflowEvent]:
         tool_name = render_template(node["tool"], run_state.state)
         tool = self.tools.get(tool_name)
+        logger.debug("executing tool node %s with tool %s", node["id"], tool_name)
         tool = self._effective_tool_for_node(tool, node)
         args = await self._render_node_value(node, run_state, node.get("args", {}))
         input_schema = node.get("input_schema") or tool.input_schema
@@ -84,6 +89,7 @@ class BasicNodeExecutorMixin:
             },
         )
         if policy_decision.decision == "deny":
+            logger.info("tool %s denied: %s", tool_name, policy_decision.reason)
             raise PermissionDenied(policy_decision.reason)
 
         if policy_decision.decision == "confirm" and not approval:
@@ -251,6 +257,7 @@ class BasicNodeExecutorMixin:
             created_at_ms=self._now_ms(),
             expires_at_ms=self._expires_at_ms(),
         )
+        logger.debug("human node %s creating pending action %s", node["id"], action.id)
         yield await self._event(
             "human.required",
             run_state,

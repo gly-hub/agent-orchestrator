@@ -40,9 +40,16 @@ Default values support strings, numbers, booleans, `null`, and simple arrays.
 - `{{path}} not in [literal, ...]`
 - `expression and expression`
 - `expression or expression`
+- `(expression)` for grouping precedence
 
-Parentheses, function calls, arithmetic, object literals, and arbitrary Python
-or JavaScript expressions are not supported.
+Parentheses can be used to override the default `and`/`or` evaluation order:
+
+```text
+({{context.score}} >= 90 or {{context.level}} == 'vip') and {{context.active}} == true
+```
+
+Function calls, arithmetic, object literals, and arbitrary Python or JavaScript
+expressions are not supported.
 
 Condition routing does not create a nested execution scope. `human` nodes may be
 used normally before or after condition nodes, and on paths selected by edge

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import contextvars
-from typing import Protocol
+from collections.abc import AsyncIterator
+from typing import Any, Protocol
 
 from agent_orchestrator.events import EventStore
 from agent_orchestrator.models import WorkflowEvent
@@ -33,3 +34,13 @@ async def record_event(event_store: EventStore, event: WorkflowEvent) -> Workflo
     else:
         await buffer.append(event)
     return event
+
+
+async def drain(agen: AsyncIterator[Any]) -> None:
+    """Consume an async generator, discarding yielded values.
+
+    Used by child engines where events are captured via EVENT_BUFFER
+    rather than yielded to the caller.
+    """
+    async for _ in agen:
+        pass

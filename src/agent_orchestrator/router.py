@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from agent_orchestrator.models import RunState, WorkflowConfig
 from agent_orchestrator.state import evaluate_when
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowRouter:
@@ -20,7 +23,9 @@ class WorkflowRouter:
 
     def next_node_id(self, run_state: RunState) -> str | None:
         if run_state.current_node_id is None:
-            return self._node_ids[0] if self._node_ids else None
+            next_id = self._node_ids[0] if self._node_ids else None
+            logger.debug("routing to first node: %s", next_id)
+            return next_id
 
         current_record = run_state.state.get("nodes", {}).get(run_state.current_node_id, {})
         if current_record.get("status") == "pending":
@@ -32,7 +37,9 @@ class WorkflowRouter:
                 if not self._edge_matches_status(edge, current_record):
                     continue
                 if evaluate_when(edge.get("when"), run_state.state):
+                    logger.debug("routing from %s to %s via edge", run_state.current_node_id, edge["to"])
                     return edge["to"]
+            logger.debug("no matching edge from %s, workflow ending", run_state.current_node_id)
             return None
 
         current_idx = self._node_ids.index(run_state.current_node_id)

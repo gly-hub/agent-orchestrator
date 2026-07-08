@@ -22,6 +22,12 @@ from agent_orchestrator.events import (
     InMemoryEventStore,
     NoopEventStore,
 )
+from agent_orchestrator.migration import (
+    CURRENT_SCHEMA_VERSION,
+    EventMigrationRegistry,
+    V1ToV2Migration,
+    default_migration_registry,
+)
 from agent_orchestrator.models import (
     AgentDefinition,
     PendingAction,
@@ -66,6 +72,7 @@ from agent_orchestrator.workflow_nodes import (
     ConditionCase,
     ConditionNode,
     HumanNode,
+    LoopNode,
     ParallelNode,
     SubflowNode,
     SubflowWorkflow,
@@ -89,8 +96,10 @@ __all__ = [
     "CompactableEventStore",
     "ConditionCase",
     "ConditionNode",
+    "CURRENT_SCHEMA_VERSION",
     "DEFAULT_PERSISTENCE_PLUGINS",
     "EventStore",
+    "EventMigrationRegistry",
     "EngineErrorObserver",
     "EventCompactionResult",
     "FileArtifactStore",
@@ -101,6 +110,7 @@ __all__ = [
     "InMemoryArtifactStore",
     "InMemoryEventStore",
     "InMemoryCheckpointStore",
+    "LoopNode",
     "NoopEventStore",
     "PendingAction",
     "PersistencePluginRegistry",
@@ -137,6 +147,7 @@ __all__ = [
     "compact_events",
     "compact_run",
     "core_persistence_plugins",
+    "default_migration_registry",
     "replay_events",
     "replay_run",
     "resolve_artifacts",
@@ -148,6 +159,7 @@ __all__ = [
     "to_message_event",
     "validate_schema_value",
     "validate_workflow_config",
+    "V1ToV2Migration",
     "workflow_event_from_dict",
     "workflow_event_to_dict",
 ]

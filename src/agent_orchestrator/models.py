@@ -9,7 +9,7 @@ from typing import Any, Literal
 from agent_orchestrator.validation import validate_workflow_config
 from agent_orchestrator.workflow_nodes import WorkflowNode, normalize_workflow_nodes
 
-NodeType = Literal["agent", "tool", "transform", "human", "condition", "parallel", "subflow"]
+NodeType = Literal["agent", "tool", "transform", "human", "condition", "parallel", "subflow", "loop"]
 RunStatus = Literal["running", "waiting_for_user", "completed", "failed"]
 NodeStatus = Literal["pending", "running", "success", "failed", "waiting", "skipped"]
 
@@ -97,13 +97,23 @@ class WorkflowEvent:
     schema_version: int = 1
 
 
-def workflow_event_from_dict(data: dict[str, Any]) -> WorkflowEvent:
-    """Deserialize a workflow event, accepting pre-versioned event payloads."""
+def workflow_event_from_dict(
+    data: dict[str, Any],
+    *,
+    migration_registry: Any | None = None,
+) -> WorkflowEvent:
+    """Deserialize a workflow event, accepting pre-versioned event payloads.
+
+    If a ``migration_registry`` is provided, events are automatically upgraded
+    to the current schema version before deserialization.
+    """
 
     payload = dict(data)
     payload.setdefault("schema_version", 1)
     payload.setdefault("data", {})
     payload.setdefault("node_id", None)
+    if migration_registry is not None:
+        payload = migration_registry.migrate(payload)
     return WorkflowEvent(**payload)
 
 

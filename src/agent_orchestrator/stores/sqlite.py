@@ -367,23 +367,29 @@ class SQLiteEventStore:
 
     def _replace_run_sync(self, run_id: str, events: list[WorkflowEvent]) -> None:
         with self._connect() as conn:
-            conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
-            conn.executemany(
-                """
-                INSERT INTO events(run_id, event_type, node_id, payload, created_at_ms)
-                VALUES(?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        event.run_id,
-                        event.type,
-                        event.node_id,
-                        _json_dumps(workflow_event_to_dict(event)),
-                        _now_ms(),
-                    )
-                    for event in events
-                ],
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+                conn.executemany(
+                    """
+                    INSERT INTO events(run_id, event_type, node_id, payload, created_at_ms)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            event.run_id,
+                            event.type,
+                            event.node_id,
+                            _json_dumps(workflow_event_to_dict(event)),
+                            _now_ms(),
+                        )
+                        for event in events
+                    ],
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -405,6 +411,7 @@ class SQLiteEventStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.isolation_level = None
         return conn
 
 

@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import uuid
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Protocol, cast
 
+from agent_orchestrator.checkpoint import InMemoryCheckpointStore
 from agent_orchestrator.exceptions import WaitingForUser, WorkflowError
-from agent_orchestrator.models import RunState, WorkflowConfig, WorkflowEvent
-from agent_orchestrator.runtime import EVENT_BUFFER, EventBuffer
+from agent_orchestrator.models import PendingAction, RunState, WorkflowConfig, WorkflowEvent
+from agent_orchestrator.runtime import EVENT_BUFFER, EventBuffer, drain
 from agent_orchestrator.state import render_template
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -115,6 +120,10 @@ class _ParallelEngine(Protocol):
     async def _record_event(self, event: WorkflowEvent) -> WorkflowEvent: ...
 
     def _now_ms(self) -> int: ...
+
+    def _expires_at_ms(self) -> int | None: ...
+
+    async def _pause_for_action(self, run_state: RunState, action: PendingAction) -> None: ...
 
 
 class _ParallelBranchRunner:
@@ -226,6 +235,17 @@ class ParallelNodeExecutorMixinProtocol(Protocol):
     ) -> WorkflowEvent: ...
 
 
+def _branch_contains_human(branch: dict[str, Any]) -> bool:
+    if branch.get("type") == "human":
+        return True
+    workflow = branch.get("workflow")
+    if isinstance(workflow, dict):
+        for node in workflow.get("nodes", []):
+            if isinstance(node, dict) and _branch_contains_human(node):
+                return True
+    return False
+
+
 class ParallelNodeExecutorMixin:
     """Executor for parallel workflow nodes."""
 
@@ -234,8 +254,24 @@ class ParallelNodeExecutorMixin:
         node: dict[str, Any],
         run_state: RunState,
     ) -> AsyncIterator[WorkflowEvent]:
-        engine = cast(_ParallelEngine, self)
         branches = list(node.get("branches", []))
+        logger.debug("parallel node %s starting %d branches", node["id"], len(branches))
+
+        has_human = any(_branch_contains_human(b) for b in branches)
+        if has_human:
+            async for event in self._run_parallel_node_sequential(node, run_state, branches):
+                yield event
+        else:
+            async for event in self._run_parallel_node_concurrent(node, run_state, branches):
+                yield event
+
+    async def _run_parallel_node_concurrent(
+        self,
+        node: dict[str, Any],
+        run_state: RunState,
+        branches: list[dict[str, Any]],
+    ) -> AsyncIterator[WorkflowEvent]:
+        engine = cast(_ParallelEngine, self)
         scheduler = _ParallelScheduler(cast(ParallelNodeExecutorMixinProtocol, self), branches, run_state)
         tasks, parent_event_sink = scheduler.start()
         results_by_branch: dict[str, dict[str, Any]] = {}
@@ -265,6 +301,267 @@ class ParallelNodeExecutorMixin:
         if failed_branches and failure_policy == "fail":
             failed_ids = ", ".join(branch["id"] for branch in failed_branches)
             raise WorkflowError(f"parallel branches failed: {failed_ids}")
+
+    async def _run_parallel_node_sequential(
+        self,
+        node: dict[str, Any],
+        run_state: RunState,
+        branches: list[dict[str, Any]],
+    ) -> AsyncIterator[WorkflowEvent]:
+        engine = cast(_ParallelEngine, self)
+        node_record = run_state.state.setdefault("nodes", {}).setdefault(node["id"], {})
+        results_by_branch: dict[str, dict[str, Any]] = node_record.pop("_seq_completed", {})
+        original_node_ids = set(run_state.state.get("nodes", {}))
+        resumed_branch_id = node_record.pop("_seq_waiting_branch", None)
+        resumed_decision = node_record.pop("approval", None)
+
+        for branch in branches:
+            if branch["id"] in results_by_branch:
+                continue
+
+            if branch["id"] == resumed_branch_id and resumed_decision is not None:
+                result = await self._resume_sequential_branch(
+                    engine, branch, run_state, node, resumed_decision, node_record,
+                )
+            else:
+                result = await self._run_sequential_branch(
+                    engine, branch, run_state, node, original_node_ids,
+                )
+
+            if result is not None and result.get("_waiting"):
+                node_record["_seq_completed"] = results_by_branch
+                action = result["_action"]
+                yield await engine._event(
+                    "human.required",
+                    run_state,
+                    node_id=node["id"],
+                    data={
+                        "pending_action_id": action.id,
+                        "request": action.request,
+                    },
+                )
+                await engine._pause_for_action(run_state, action)
+                return
+
+            if result is None:
+                return
+
+            results_by_branch[branch["id"]] = result
+
+        output, failed_branches = _ParallelResultMerger(
+            branches,
+            results_by_branch,
+            run_state,
+        ).merge()
+        await engine._save_node_output(run_state, node["id"], output, node=node)
+
+        failure_policy = node.get("failure_policy", node.get("partial_failure_policy", "fail"))
+        if failed_branches and failure_policy == "fail":
+            failed_ids = ", ".join(branch["id"] for branch in failed_branches)
+            raise WorkflowError(f"parallel branches failed: {failed_ids}")
+
+    async def _run_sequential_branch(
+        self,
+        engine: Any,
+        branch: dict[str, Any],
+        run_state: RunState,
+        node: dict[str, Any],
+        original_node_ids: set[str],
+    ) -> dict[str, Any] | None:
+        if "workflow" in branch and "type" not in branch:
+            return await self._run_sequential_workflow_branch(
+                engine, branch, run_state, node,
+            )
+
+        branch_state = deepcopy(run_state)
+        branch_state.current_node_id = branch["id"]
+        error: Exception | None = None
+        try:
+            await self._execute_branch_node(branch, branch_state)
+        except Exception as exc:
+            error = exc
+
+        records = {}
+        for nid, record in branch_state.state.get("nodes", {}).items():
+            if nid == branch["id"] or nid not in original_node_ids:
+                records[nid] = deepcopy(record)
+
+        return {
+            "branch_id": branch["id"],
+            "records": records,
+            "error": str(error) if error else None,
+            "error_type": type(error).__name__ if error else None,
+        }
+
+    async def _run_sequential_workflow_branch(
+        self,
+        engine: Any,
+        branch: dict[str, Any],
+        run_state: RunState,
+        node: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        child_checkpoints = InMemoryCheckpointStore()
+        workflow_data = deepcopy(branch["workflow"])
+        workflow_data.setdefault("id", f"{run_state.workflow_id}.{branch['id']}")
+        workflow_data.setdefault("version", run_state.workflow_version)
+        child_workflow = WorkflowConfig.from_dict(workflow_data)
+        child_input = render_template(branch.get("input", run_state.state.get("input", {})), run_state.state)
+        if not isinstance(child_input, dict):
+            child_input = {"value": child_input}
+        child_state = RunState(
+            run_id=run_state.run_id,
+            workflow_id=child_workflow.id,
+            workflow_version=child_workflow.version,
+            status="running",
+            current_node_id=None,
+            waiting_action_id=None,
+            state={
+                "input": child_input,
+                "context": deepcopy(run_state.state.get("context", {})),
+                "messages": deepcopy(run_state.state.get("messages", {})),
+                "nodes": {},
+            },
+        )
+
+        result = await self._execute_parallel_child(
+            engine, branch, run_state, node, child_workflow, child_state, child_checkpoints,
+        )
+        return result
+
+    async def _execute_parallel_child(
+        self,
+        engine: Any,
+        branch: dict[str, Any],
+        run_state: RunState,
+        node: dict[str, Any],
+        child_workflow: WorkflowConfig,
+        child_state: RunState,
+        child_checkpoints: InMemoryCheckpointStore,
+    ) -> dict[str, Any] | None:
+        engine_factory = cast(Any, type(self))
+        child_engine = engine_factory(
+            child_workflow,
+            agents=engine.agents,
+            tools=engine.tools,
+            checkpoints=child_checkpoints,
+            event_store=engine.event_store,
+            artifact_store=engine.artifact_store,
+            artifact_threshold_bytes=engine.artifact_threshold_bytes,
+            pending_action_ttl_ms=engine.pending_action_ttl_ms,
+            policy_gate=engine.policy_gate,
+            raise_on_error=engine.raise_on_error,
+            error_observer=engine.error_observer,
+            observer=engine.observer,
+        )
+        buffer: list[WorkflowEvent] = []
+        token = EVENT_BUFFER.set(buffer)
+        error: Exception | None = None
+        try:
+            child_runtime = cast(_ParallelEngine, child_engine)
+            await drain(child_runtime._continue(child_state))
+        except Exception as exc:
+            error = exc
+        finally:
+            EVENT_BUFFER.reset(token)
+
+        waiting_event: WorkflowEvent | None = None
+        for event in buffer:
+            if event.type in {"run.started", "run.resumed", "run.finished"}:
+                continue
+            if event.type == "run.waiting":
+                waiting_event = event
+                continue
+            if event.type == "run.failed":
+                error = WorkflowError(event.data.get("error", "parallel workflow branch failed"))
+            await engine._record_event(self._namespace_branch_event(event, branch["id"]))
+
+        if waiting_event is not None:
+            child_action_id = waiting_event.data.get("pending_action_id", "")
+            child_action = await child_checkpoints.load_action(child_action_id)
+
+            node_record = run_state.state.setdefault("nodes", {}).setdefault(node["id"], {})
+            completed = node_record.get("_seq_completed", {})
+            node_record["_seq_completed"] = completed
+            node_record["_seq_waiting_branch"] = branch["id"]
+            node_record["_seq_child_state"] = asdict(child_state)
+            node_record["_seq_child_workflow"] = {
+                "id": child_workflow.id,
+                "version": child_workflow.version,
+                "nodes": [dict(n) for n in child_workflow.nodes],
+                "edges": list(child_workflow.edges),
+                "policy": dict(child_workflow.policy),
+            }
+            node_record["_seq_child_human_node_id"] = child_action.node_id
+
+            action = PendingAction(
+                id=f"pa_{uuid.uuid4().hex}",
+                run_id=run_state.run_id,
+                node_id=node["id"],
+                action_type="parallel_human",
+                request={
+                    **child_action.request,
+                    "child_pending_action_id": child_action_id,
+                    "child_human_node_id": child_action.node_id,
+                    "parallel_branch_id": branch["id"],
+                },
+                created_at_ms=engine._now_ms(),
+                expires_at_ms=engine._expires_at_ms(),
+            )
+            return {"_waiting": True, "_action": action}
+
+        prefixed_records = {
+            f"{branch['id']}.{nid}": deepcopy(record)
+            for nid, record in child_state.state.get("nodes", {}).items()
+        }
+        selected_output = self._parallel_workflow_output(branch, child_workflow, child_state)
+        branch_record = {
+            "status": "failed" if error else "success",
+            "output": selected_output,
+            "workflow_id": child_workflow.id,
+            "nodes": prefixed_records,
+        }
+        if error:
+            branch_record["error"] = str(error)
+            branch_record["error_type"] = type(error).__name__
+            branch_record["output"] = {
+                "failed": True,
+                "error": str(error),
+                "error_type": type(error).__name__,
+            }
+        records = {branch["id"]: branch_record, **prefixed_records}
+        return {
+            "branch_id": branch["id"],
+            "records": records,
+            "error": str(error) if error else None,
+            "error_type": type(error).__name__ if error else None,
+        }
+
+    async def _resume_sequential_branch(
+        self,
+        engine: Any,
+        branch: dict[str, Any],
+        run_state: RunState,
+        node: dict[str, Any],
+        decision: dict[str, Any],
+        node_record: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        child_state_data = node_record.pop("_seq_child_state")
+        child_workflow_data = node_record.pop("_seq_child_workflow")
+        child_human_node_id = node_record.pop("_seq_child_human_node_id")
+
+        child_state = RunState(**child_state_data)
+        child_state.status = "running"
+        child_state.waiting_action_id = None
+        child_human_record = child_state.state["nodes"][child_human_node_id]
+        child_human_record["status"] = "success"
+        child_human_record["output"] = decision
+
+        child_workflow = WorkflowConfig.from_dict(child_workflow_data, validate=False)
+        child_checkpoints = InMemoryCheckpointStore()
+
+        return await self._execute_parallel_child(
+            engine, branch, run_state, node, child_workflow, child_state, child_checkpoints,
+        )
 
     async def _record_parallel_event(
         self,
@@ -325,8 +622,7 @@ class ParallelNodeExecutorMixin:
         error: Exception | None = None
         try:
             child_runtime = cast(_ParallelEngine, child_engine)
-            async for _ in child_runtime._continue(child_state):
-                pass
+            await drain(child_runtime._continue(child_state))
         except Exception as exc:
             error = exc
         finally:
@@ -401,8 +697,7 @@ class ParallelNodeExecutorMixin:
         await engine._event("node.started", run_state, node_id=node["id"])
 
         try:
-            async for _ in engine._run_node_with_retry(node, run_state):
-                pass
+            await drain(engine._run_node_with_retry(node, run_state))
         except WaitingForUser as exc:
             node_record["status"] = "failed"
             node_record["error"] = "parallel branches do not support waiting actions"

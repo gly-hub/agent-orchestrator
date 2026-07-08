@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any
@@ -12,6 +13,8 @@ from agent_orchestrator.models import RunState, StartRunRequest, WorkflowEvent
 from agent_orchestrator.observability import WorkflowObservation, WorkflowObserver, notify_observer
 from agent_orchestrator.runtime import record_event
 from agent_orchestrator.state import render_template
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowExecutionContext:

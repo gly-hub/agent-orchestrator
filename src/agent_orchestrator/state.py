@@ -94,6 +94,7 @@ def evaluate_when(expression: str | None, state: dict[str, Any]) -> bool:
     - {{path}} not in [literal, ...]
     - expression and expression
     - expression or expression
+    - (expression) for grouping
     - {{path}} as a truthiness check
     """
 
@@ -101,6 +102,11 @@ def evaluate_when(expression: str | None, state: dict[str, Any]) -> bool:
         return True
 
     expr = expression.strip()
+
+    paren_inner = _extract_parenthesized(expr)
+    if paren_inner is not None:
+        return evaluate_when(paren_inner, state)
+
     or_parts = _split_keyword(expr, "or")
     if len(or_parts) > 1:
         return any(evaluate_when(part, state) for part in or_parts)
@@ -128,8 +134,6 @@ def validate_when_syntax(expression: str | None) -> None:
     expr = expression.strip()
     if not expr:
         return
-    if "(" in expr or ")" in expr:
-        raise StateResolutionError("unsupported parentheses or function syntax")
 
     _validate_when_clause(expr)
 
@@ -142,6 +146,11 @@ def _validate_when_clause(expression: str) -> None:
             or expression.endswith(f" {keyword}")
         ):
             raise StateResolutionError(f"empty condition around {keyword}")
+
+    paren_inner = _extract_parenthesized(expression)
+    if paren_inner is not None:
+        _validate_when_clause(paren_inner)
+        return
 
     or_parts = _split_keyword(expression, "or")
     if len(or_parts) > 1:
@@ -334,6 +343,7 @@ def _find_top_level_token(
     quote: str | None = None
     bracket_depth = 0
     brace_depth = 0
+    paren_depth = 0
     index = start
     while index <= len(expression) - len(token):
         char = expression[index]
@@ -354,6 +364,14 @@ def _find_top_level_token(
             brace_depth -= 1
             index += 2
             continue
+        if char == "(":
+            paren_depth += 1
+            index += 1
+            continue
+        if char == ")":
+            paren_depth -= 1
+            index += 1
+            continue
         if char == "[":
             bracket_depth += 1
             index += 1
@@ -365,6 +383,7 @@ def _find_top_level_token(
         if (
             bracket_depth == 0
             and brace_depth == 0
+            and paren_depth == 0
             and expression.startswith(token, index)
             and (
                 not require_word_boundary
@@ -374,6 +393,25 @@ def _find_top_level_token(
             return index
         index += 1
     return -1
+
+
+def _extract_parenthesized(expression: str) -> str | None:
+    """If the entire expression is wrapped in matching parentheses, return the inner content."""
+
+    expr = expression.strip()
+    if not expr.startswith("(") or not expr.endswith(")"):
+        return None
+    depth = 0
+    for index, char in enumerate(expr):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if depth == 0 and index < len(expr) - 1:
+            return None
+    if depth != 0:
+        return None
+    return expr[1:-1].strip()
 
 
 def _has_word_boundaries(expression: str, start: int, end: int) -> bool:

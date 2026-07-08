@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 from dataclasses import dataclass, field
+from string import Template
 from typing import Any
 
 from agent_orchestrator.models import RunState, WorkflowEvent
@@ -111,7 +112,7 @@ class ClaudeAgentRunner:
 
     def _build_prompt(self, agent_input: dict[str, Any]) -> str:
         if self.config.prompt_template:
-            return self.config.prompt_template.format(**agent_input)
+            return Template(self.config.prompt_template).safe_substitute(agent_input)
         if "message" in agent_input:
             return str(agent_input["message"])
         return json.dumps(agent_input, ensure_ascii=False, indent=2, sort_keys=True)

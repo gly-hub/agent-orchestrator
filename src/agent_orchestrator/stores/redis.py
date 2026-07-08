@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import asdict
 from typing import Any
@@ -17,6 +18,8 @@ from agent_orchestrator.models import (
     workflow_event_to_dict,
 )
 from agent_orchestrator.schema import validate_schema_value
+
+logger = logging.getLogger(__name__)
 
 try:
     from redis.asyncio import Redis
@@ -107,6 +110,11 @@ class RedisCheckpointStore(BaseCheckpointStore):
                 await self._save_action(action)
             raise
         if not hasattr(self.client, "eval"):
+            logger.warning(
+                "Redis client does not support EVAL; "
+                "resolve_action falls back to a non-atomic sequence "
+                "that is unsafe under concurrent resumes",
+            )
             if action.status != "pending":
                 raise WorkflowError(f"pending action already resolved: {pending_action_id}")
             if not await self._mark_executed_once(pending_action_id):

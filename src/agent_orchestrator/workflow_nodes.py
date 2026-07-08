@@ -88,7 +88,14 @@ class SubflowNode(BaseNode):
     workflow: SubflowWorkflow
 
 
-WorkflowNode = AgentNode | ToolNode | TransformNode | HumanNode | ConditionNode | ParallelNode | SubflowNode
+class LoopNode(BaseNode):
+    type: Literal["loop"]
+    body: SubflowWorkflow
+    condition: NotRequired[str]
+    max_iterations: NotRequired[int]
+
+
+WorkflowNode = AgentNode | ToolNode | TransformNode | HumanNode | ConditionNode | ParallelNode | SubflowNode | LoopNode
 
 
 def normalize_workflow_node(node: dict[str, Any]) -> WorkflowNode:
@@ -122,6 +129,15 @@ def normalize_workflow_node(node: dict[str, Any]) -> WorkflowNode:
         workflow["edges"] = list(workflow.get("edges", []))
         workflow["policy"] = dict(workflow.get("policy", {}))
         normalized["workflow"] = workflow
+    elif normalized.get("type") == "loop" and isinstance(normalized.get("body"), dict):
+        body = dict(normalized["body"])
+        body["nodes"] = [
+            normalize_workflow_node(cast(dict[str, Any], child))
+            for child in body.get("nodes", [])
+        ]
+        body["edges"] = list(body.get("edges", []))
+        body["policy"] = dict(body.get("policy", {}))
+        normalized["body"] = body
     return cast(WorkflowNode, normalized)
 
 

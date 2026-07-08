@@ -12,4 +12,4 @@ typecheck:
 	python3 -m pyright src
 
 test:
-	PYTHONPATH=src python3 -m pytest tests/
+	PYTHONPATH=src python3 -m pytest tests/ --cov=agent_orchestrator --cov-report=term-missing

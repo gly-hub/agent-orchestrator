@@ -1,5 +1,8 @@
 """Minimal aiohttp server for the workflow engine.
 
+Demonstrates: SSE streaming over HTTP, human confirmation endpoint, resume endpoint.
+Chinese strings in node configs are sample UI labels.
+
 Run:
     python3 examples/aiohttp_orchestrator_server.py
 

@@ -1,4 +1,8 @@
-"""Run a resumable workflow using SQLite checkpoint and event stores."""
+"""Run a resumable workflow using SQLite checkpoint and event stores.
+
+Demonstrates: SQLiteCheckpointStore, SQLiteEventStore, cross-engine resume, event replay.
+Chinese strings in node configs are sample UI labels.
+"""
 
 from __future__ import annotations
 

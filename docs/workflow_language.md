@@ -57,16 +57,21 @@ used normally before or after condition nodes, and on paths selected by edge
 
 ## Nested Scopes
 
-`parallel` branches and `subflow` workflows create nested execution scopes.
-They intentionally cannot contain `human` nodes. Human checkpoints are supported
-in the parent workflow, including ordinary condition/edge branches, but not
-inside these nested scopes.
+`parallel` branches, `subflow` workflows, and `loop` bodies create nested
+execution scopes.
 
-The config validator rejects:
+`parallel` branches that contain `human` nodes automatically fall back to
+sequential execution. When a sequential branch hits a human checkpoint, the
+parallel node pauses the entire run. On resume, the branch completes and
+remaining branches execute in order.
 
-- direct `human` nodes inside `parallel.branches`
-- `human` nodes inside workflow-style parallel branches
-- `human` nodes inside `subflow.workflow`
+`subflow` workflows support `human` nodes. When a child workflow reaches a
+human checkpoint, the subflow node pauses the parent run. On resume, the child
+workflow continues from where it left off.
+
+`loop` bodies cannot contain `human` nodes. The config validator rejects any
+`human` node inside a loop body because resumable checkpoints conflict with
+iteration semantics.
 
 ## Schemas
 

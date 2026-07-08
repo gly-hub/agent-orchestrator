@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dandelion-orchestrator"
-version = "0.1.1"
+version = "0.1.2"
 description = "Composable Agent Workflow Engine with resumable human checkpoints."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,7 +33,7 @@ aiohttp = ["aiohttp>=3.9.0"]
 claude = ["claude-agent-sdk>=0.2.101"]
 redis = ["redis>=5.0.0"]
 all = ["aiohttp>=3.9.0", "claude-agent-sdk>=0.2.101", "redis>=5.0.0"]
-dev = ["ruff>=0.6.0", "pyright>=1.1.370", "redis>=5.0.0", "pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
+dev = ["ruff>=0.6.0", "pyright>=1.1.370", "redis>=5.0.0", "pytest>=8.0.0", "pytest-asyncio>=0.23.0", "pytest-cov>=5.0.0"]
 
 [tool.setuptools.package-dir]
 "" = "src"
@@ -60,6 +60,13 @@ keep-runtime-typing = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["agent_orchestrator"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
 
 [tool.pyright]
 include = ["src"]

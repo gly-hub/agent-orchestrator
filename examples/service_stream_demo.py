@@ -1,4 +1,8 @@
-"""Service-style demo that emits SSE frames for start and resume phases."""
+"""Service-style demo that emits SSE frames for start and resume phases.
+
+Demonstrates: to_message_event conversion, stream_sse helper, two-phase flow.
+Chinese strings in node configs are sample UI labels.
+"""
 
 from __future__ import annotations
 

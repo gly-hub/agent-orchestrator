@@ -14,12 +14,13 @@ Options:
   --skip-check  Skip `make check`.
   --skip-git    Skip git clean-state check, push, and tag push.
   --no-clean    Do not remove dist/ before building.
+  --gh-release  Create a GitHub Release from CHANGELOG.md after tagging.
   -h, --help    Show this help.
 
 Examples:
   scripts/release_pypi.sh
   scripts/release_pypi.sh --testpypi
-  scripts/release_pypi.sh --pypi
+  scripts/release_pypi.sh --pypi --gh-release
 
 Notes:
   - Install release and check tools first:
@@ -27,6 +28,7 @@ Notes:
       python3 -m pip install -e ".[dev]"
   - For upload, Twine expects credentials from ~/.pypirc, keyring, or prompt.
     PyPI token upload username is __token__.
+  - --gh-release requires the GitHub CLI (gh).
 EOF
 }
 
@@ -47,6 +49,7 @@ upload_target=""
 run_check=1
 run_git=1
 clean_dist=1
+gh_release=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,6 +67,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-clean)
       clean_dist=0
+      ;;
+    --gh-release)
+      gh_release=1
       ;;
     -h|--help)
       usage
@@ -161,3 +167,30 @@ case "${upload_target}" in
     python3 -m twine upload dist/*
     ;;
 esac
+
+if [[ "${gh_release}" -eq 1 ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "GitHub CLI (gh) not found. Skipping GitHub Release." >&2
+  else
+    notes_file="$(mktemp)"
+    trap 'rm -f "${notes_file}"' EXIT
+    if [[ -f CHANGELOG.md ]]; then
+      python3 - "${version}" "${notes_file}" <<'PY'
+import re, sys
+version = sys.argv[1]
+out_path = sys.argv[2]
+text = open("CHANGELOG.md", encoding="utf-8").read()
+pattern = rf"## \[{re.escape(version)}\].*?\n(.*?)(?=\n## \[|\Z)"
+match = re.search(pattern, text, re.DOTALL)
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(match.group(1).strip() if match else "")
+PY
+    fi
+    echo "Creating GitHub Release ${tag}..."
+    if [[ -s "${notes_file}" ]]; then
+      gh release create "${tag}" dist/* --title "${tag}" --notes-file "${notes_file}"
+    else
+      gh release create "${tag}" dist/* --title "${tag}" --generate-notes
+    fi
+  fi
+fi

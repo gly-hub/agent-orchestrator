@@ -1,4 +1,8 @@
-"""Run a small in-memory workflow with a human checkpoint."""
+"""Run a small in-memory workflow with a human checkpoint.
+
+Demonstrates: agent nodes, tool nodes, human confirmation, and resume flow.
+Chinese strings in node configs are sample UI labels.
+"""
 
 from __future__ import annotations
 

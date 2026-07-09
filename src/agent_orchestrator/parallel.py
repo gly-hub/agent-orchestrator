@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol, cast
@@ -38,6 +38,36 @@ class _QueueEventSink:
 
     async def append(self, event: WorkflowEvent) -> None:
         await self.queue.put(_ParallelEventItem(event))
+
+
+async def _append_to_event_sink(sink: EventBuffer, event: WorkflowEvent) -> None:
+    if sink is None:
+        return
+    if isinstance(sink, list):
+        sink.append(event)
+        return
+    await sink.append(event)
+
+
+class _NamespacedParallelWorkflowEventSink:
+    def __init__(
+        self,
+        parent_sink: EventBuffer,
+        branch_id: str,
+        namespace_event: Callable[[WorkflowEvent, str], WorkflowEvent],
+    ) -> None:
+        self.parent_sink = parent_sink
+        self.branch_id = branch_id
+        self.namespace_event = namespace_event
+        self.control_events: list[WorkflowEvent] = []
+
+    async def append(self, event: WorkflowEvent) -> None:
+        if event.type in {"run.started", "run.resumed", "run.finished"}:
+            return
+        if event.type in {"run.waiting", "run.failed"}:
+            self.control_events.append(event)
+        namespaced = self.namespace_event(event, self.branch_id)
+        await _append_to_event_sink(self.parent_sink, namespaced)
 
 
 @dataclass(slots=True)
@@ -617,8 +647,13 @@ class ParallelNodeExecutorMixin:
             error_observer=engine.error_observer,
             observer=engine.observer,
         )
-        buffer: list[WorkflowEvent] = []
-        token = EVENT_BUFFER.set(buffer)
+        parent_event_sink = EVENT_BUFFER.get()
+        child_event_sink = _NamespacedParallelWorkflowEventSink(
+            parent_event_sink,
+            branch["id"],
+            self._namespace_branch_event,
+        )
+        token = EVENT_BUFFER.set(child_event_sink)
         error: Exception | None = None
         try:
             child_runtime = cast(_ParallelEngine, child_engine)
@@ -628,14 +663,11 @@ class ParallelNodeExecutorMixin:
         finally:
             EVENT_BUFFER.reset(token)
 
-        for event in buffer:
-            if event.type in {"run.started", "run.resumed", "run.finished"}:
-                continue
+        for event in child_event_sink.control_events:
             if event.type == "run.waiting":
                 error = WorkflowError("parallel workflow branches do not support waiting actions")
             if event.type == "run.failed":
                 error = WorkflowError(event.data.get("error", "parallel workflow branch failed"))
-            await engine._record_event(self._namespace_branch_event(event, branch["id"]))
 
         prefixed_records = {
             f"{branch['id']}.{node_id}": deepcopy(record)

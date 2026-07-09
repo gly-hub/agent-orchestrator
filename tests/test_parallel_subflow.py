@@ -101,6 +101,58 @@ async def test_parallel_node_streams_branch_events_as_they_happen():
 
     assert branch_finishes == ["fast", "slow"]
 
+async def test_parallel_workflow_branch_streams_child_events_while_child_runs():
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+    release_child = asyncio.Event()
+
+    async def blocking_tool(args, run_state):
+        await release_child.wait()
+        return {"value": "done"}
+
+    tools.register("blocking", blocking_tool)
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "parallel-workflow-live-events",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "fanout",
+                    "type": "parallel",
+                    "branches": [
+                        {
+                            "id": "child",
+                            "workflow": {
+                                "nodes": [
+                                    {"id": "block", "type": "tool", "tool": "blocking"},
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools)
+    stream = engine.start(StartRunRequest(message="go")).__aiter__()
+
+    async def next_child_start():
+        for _ in range(10):
+            event = await anext(stream)
+            if event.type == "parallel.node.started" and event.node_id == "child.block":
+                return event
+        raise AssertionError("child workflow start event was not streamed")
+
+    try:
+        child_started = await asyncio.wait_for(next_child_start(), timeout=1)
+        assert child_started.data["parallel_branch_id"] == "child"
+        assert not release_child.is_set()
+    finally:
+        release_child.set()
+
+    remaining = [event async for event in stream]
+    assert remaining[-1].type == "run.finished"
+
 async def test_parallel_node_cancels_branch_tasks_when_stream_closes():
     agents = AgentRegistry()
     tools = ToolRegistry()
@@ -620,4 +672,3 @@ async def test_parallel_workflow_branch_with_human_pauses_and_resumes():
     output = node_finished[0].data["output"]
     assert output["branches"]["auto"] == {"result": "processed auto"}
     assert output["branches"]["manual"] == {"result": "processed manual_value"}
-

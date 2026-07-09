@@ -51,19 +51,38 @@ Parentheses can be used to override the default `and`/`or` evaluation order:
 Function calls, arithmetic, object literals, and arbitrary Python or JavaScript
 expressions are not supported.
 
-Condition routing does not create a nested execution scope. `human` nodes may be
-used normally before or after condition nodes, and on paths selected by edge
-`when` rules.
+Condition routing does not create a nested execution scope. A condition node
+writes its selected value to state, and outgoing edges use `when` expressions to
+activate only the selected paths. Edges whose `when` expression evaluates false
+are skipped and do not block downstream joins.
+
+## DAG Scheduling
+
+The runtime executes workflows as explicit DAGs. Node declaration order is only
+a stable listing order; it does not imply execution order. If one node depends
+on another, the workflow must include an edge.
+
+Nodes with no incoming edges are entry nodes and may run concurrently. A node
+with multiple incoming edges is an implicit join. By default, it waits for all
+active incoming paths. Paths skipped by conditions do not block the join.
+
+`human` nodes pause only their own DAG path. Other ready nodes continue running.
+When no ready or running nodes remain and one or more human actions are pending,
+the run emits `run.waiting`. `run.waiting` includes `pending_action_ids`, and
+also includes the legacy `pending_action_id` field when there is exactly one
+pending action.
+
+Supported join policies:
+
+- `all_active`: default; wait for all active incoming paths
+- `all_success`: wait for all active incoming paths and require successful predecessors
+- `any`: run after the first active incoming path completes
 
 ## Nested Scopes
 
-`parallel` branches, `subflow` workflows, and `loop` bodies create nested
-execution scopes.
-
-`parallel` branches that contain `human` nodes automatically fall back to
-sequential execution. When a sequential branch hits a human checkpoint, the
-parallel node pauses the entire run. On resume, the branch completes and
-remaining branches execute in order.
+`subflow` workflows and `loop` bodies create nested execution scopes. A
+`parallel` node remains available as a compact branch-output compatibility
+primitive, but general concurrency is provided by DAG scheduling.
 
 `subflow` workflows support `human` nodes. When a child workflow reaches a
 human checkpoint, the subflow node pauses the parent run. On resume, the child

@@ -88,6 +88,9 @@ def _validate_node_options(node_id: str, node: dict[str, Any]) -> None:
     confirmation_policy = node.get("confirmation_policy")
     if confirmation_policy is not None and confirmation_policy not in {"never", "always", "risk_based"}:
         raise WorkflowConfigError(f"node {node_id} confirmation_policy is unsupported")
+    join_policy = node.get("join_policy")
+    if join_policy is not None and join_policy not in {"all_active", "all_success", "any"}:
+        raise WorkflowConfigError(f"node {node_id} join_policy is unsupported")
 
     retry = node.get("retry")
     if retry is not None:
@@ -159,6 +162,10 @@ def _validate_node_options(node_id: str, node: dict[str, Any]) -> None:
                 _validate_parallel_workflow_branch(node_id, branch_id, branch)
                 continue
             branch_type = branch.get("type")
+            if branch_type == "human":
+                raise WorkflowConfigError(
+                    f"node {node_id} branch {branch_id} cannot be a human node; use DAG edges for concurrent human paths"
+                )
             if branch_type == "parallel":
                 raise WorkflowConfigError(f"node {node_id} branch {branch_id} cannot be a nested parallel node")
             if branch_type not in SUPPORTED_NODE_TYPES:
@@ -238,6 +245,10 @@ def _validate_parallel_workflow_branch(
         policy=dict(workflow.get("policy", {})),
     )
     validate_workflow_config(child_config)
+    if _workflow_contains_node_type(child_config.nodes, "human"):
+        raise WorkflowConfigError(
+            f"node {node_id} branch {branch_id} workflow cannot contain human nodes; use DAG edges for concurrent human paths"
+        )
 
 
 def _validate_policy(policy: Any) -> None:

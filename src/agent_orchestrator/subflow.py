@@ -257,6 +257,9 @@ class SubflowNodeExecutorMixin:
         child_human_record = child_state.state["nodes"][child_human_node_id]
         child_human_record["status"] = "success"
         child_human_record["output"] = decision
+        child_human_record.pop("_dag_outgoing_processed", None)
+        child_scheduler = child_state.state.setdefault("scheduler", {})
+        child_scheduler["waiting_actions"] = {}
 
         child_workflow = WorkflowConfig.from_dict(child_workflow_data, validate=False)
         logger.debug("subflow node %s resuming child workflow %s", node["id"], child_workflow.id)

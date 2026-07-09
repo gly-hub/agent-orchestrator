@@ -125,10 +125,14 @@ class RedisCheckpointStore(BaseCheckpointStore):
         run_state = await self.load_run(action.run_id)
         run_state.status = "running"
         run_state.waiting_action_id = None
+        scheduler = run_state.state.setdefault("scheduler", {})
+        waiting_actions = scheduler.setdefault("waiting_actions", {})
+        waiting_actions.pop(pending_action_id, None)
         node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
         if action.action_type == "human":
             node_record["status"] = "success"
             node_record["output"] = resolved_decision
+            node_record.pop("_dag_outgoing_processed", None)
         else:
             node_record["status"] = "pending"
             node_record["approval"] = resolved_decision

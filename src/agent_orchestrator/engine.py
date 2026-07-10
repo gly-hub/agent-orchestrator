@@ -320,7 +320,7 @@ class WorkflowEngine(
         run_state.waiting_action_id = action.id
         node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
         node_record["status"] = "waiting"
-        scheduler = run_state.state.setdefault("scheduler", {})
+        scheduler = run_state.state.setdefault("_internal", {}).setdefault("scheduler", {})
         waiting_actions = scheduler.setdefault("waiting_actions", {})
         waiting_actions[action.id] = {
             "node_id": action.node_id,

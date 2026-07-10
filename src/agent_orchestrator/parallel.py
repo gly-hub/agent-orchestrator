@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
+from agent_orchestrator.engine_protocol import EngineProtocol
 from agent_orchestrator.exceptions import WaitingForUser, WorkflowError
 from agent_orchestrator.models import RunState, WorkflowConfig, WorkflowEvent
 from agent_orchestrator.runtime import EVENT_BUFFER, EventBuffer, drain
@@ -83,9 +84,17 @@ class _ParallelResultMerger:
         for branch in self.branches:
             result = self.results_by_branch[branch["id"]]
             for node_id, record in result["records"].items():
-                nodes_state[node_id] = deepcopy(record)
-                if node_id != result["branch_id"]:
-                    branch_nodes[node_id] = deepcopy(record)
+                target_id = node_id
+                if node_id != result["branch_id"] and node_id in nodes_state:
+                    target_id = f"{result['branch_id']}.{node_id}"
+                    logger.warning(
+                        "parallel merge: node_id %s conflicts, prefixing as %s",
+                        node_id,
+                        target_id,
+                    )
+                nodes_state[target_id] = deepcopy(record)
+                if target_id != result["branch_id"]:
+                    branch_nodes[target_id] = deepcopy(record)
             branch_record = nodes_state.get(result["branch_id"], {})
             branch_outputs[result["branch_id"]] = deepcopy(branch_record.get("output"))
             if result["error"] is not None:
@@ -105,51 +114,6 @@ class _ParallelResultMerger:
             output["nodes"] = branch_nodes
         return output, failed_branches
 
-
-class _ParallelEngine(Protocol):
-    agents: Any
-    tools: Any
-    checkpoints: Any
-    event_store: Any
-    artifact_store: Any
-    artifact_threshold_bytes: int | None
-    pending_action_ttl_ms: int | None
-    policy_gate: Any
-    raise_on_error: bool
-    error_observer: Any
-    observer: Any
-
-    def _run_node_with_retry(
-        self,
-        node: dict[str, Any],
-        run_state: RunState,
-    ) -> AsyncIterator[WorkflowEvent]: ...
-
-    def _continue(self, run_state: RunState) -> AsyncIterator[WorkflowEvent]: ...
-
-    async def _save_node_output(
-        self,
-        run_state: RunState,
-        node_id: str,
-        output: Any,
-        *,
-        node: dict[str, Any],
-    ) -> None: ...
-
-    async def _event(
-        self,
-        event_type: str,
-        run_state: RunState,
-        *,
-        node_id: str | None = None,
-        data: dict[str, Any] | None = None,
-    ) -> WorkflowEvent: ...
-
-    async def _record_event(self, event: WorkflowEvent) -> WorkflowEvent: ...
-
-    def _now_ms(self) -> int: ...
-
-    def _expires_at_ms(self) -> int | None: ...
 
 
 class _ParallelBranchRunner:
@@ -281,7 +245,7 @@ class ParallelNodeExecutorMixin:
         run_state: RunState,
         branches: list[dict[str, Any]],
     ) -> AsyncIterator[WorkflowEvent]:
-        engine = cast(_ParallelEngine, self)
+        engine = cast(EngineProtocol, self)
         scheduler = _ParallelScheduler(cast(ParallelNodeExecutorMixinProtocol, self), branches, run_state)
         tasks, parent_event_sink = scheduler.start()
         results_by_branch: dict[str, dict[str, Any]] = {}
@@ -317,7 +281,7 @@ class ParallelNodeExecutorMixin:
         event: WorkflowEvent,
         parent_event_sink: EventBuffer,
     ) -> WorkflowEvent:
-        engine = cast(_ParallelEngine, self)
+        engine = cast(EngineProtocol, self)
         token = EVENT_BUFFER.set(parent_event_sink)
         try:
             return await engine._record_event(event)
@@ -329,7 +293,6 @@ class ParallelNodeExecutorMixin:
         branch: dict[str, Any],
         run_state: RunState,
     ) -> dict[str, Any]:
-        engine = cast(_ParallelEngine, self)
         workflow_data = deepcopy(branch["workflow"])
         workflow_data.setdefault("id", f"{run_state.workflow_id}.{branch['id']}")
         workflow_data.setdefault("version", run_state.workflow_version)
@@ -351,21 +314,7 @@ class ParallelNodeExecutorMixin:
                 "nodes": {},
             },
         )
-        engine_factory = cast(Any, type(self))
-        child_engine = engine_factory(
-            child_workflow,
-            agents=engine.agents,
-            tools=engine.tools,
-            checkpoints=engine.checkpoints,
-            event_store=engine.event_store,
-            artifact_store=engine.artifact_store,
-            artifact_threshold_bytes=engine.artifact_threshold_bytes,
-            pending_action_ttl_ms=engine.pending_action_ttl_ms,
-            policy_gate=engine.policy_gate,
-            raise_on_error=engine.raise_on_error,
-            error_observer=engine.error_observer,
-            observer=engine.observer,
-        )
+        child_engine = cast(EngineProtocol, self)._create_child_engine(child_workflow)
         parent_event_sink = EVENT_BUFFER.get()
         child_event_sink = _NamespacedParallelWorkflowEventSink(
             parent_event_sink,
@@ -375,7 +324,7 @@ class ParallelNodeExecutorMixin:
         token = EVENT_BUFFER.set(child_event_sink)
         error: Exception | None = None
         try:
-            child_runtime = cast(_ParallelEngine, child_engine)
+            child_runtime = cast(EngineProtocol, child_engine)
             await drain(child_runtime._continue(child_state))
         except Exception as exc:
             error = exc
@@ -441,15 +390,17 @@ class ParallelNodeExecutorMixin:
         return deepcopy(child_state.state.get("nodes", {}).get(output_node_id, {}).get("output"))
 
     async def _execute_branch_node(self, node: dict[str, Any], run_state: RunState) -> None:
-        engine = cast(_ParallelEngine, self)
+        engine = cast(EngineProtocol, self)
         node_record = run_state.state.setdefault("nodes", {}).setdefault(node["id"], {})
         node_record["status"] = "running"
         node_record["started_at_ms"] = engine._now_ms()
         await engine._event("node.started", run_state, node_id=node["id"])
 
+        failed = False
         try:
             await drain(engine._run_node_with_retry(node, run_state))
         except WaitingForUser as exc:
+            failed = True
             node_record["status"] = "failed"
             node_record["error"] = "parallel branches do not support waiting actions"
             node_record["error_type"] = type(exc).__name__
@@ -461,6 +412,7 @@ class ParallelNodeExecutorMixin:
             await engine._event("node.failed", run_state, node_id=node["id"], data=node_record)
             raise WorkflowError(node_record["error"]) from exc
         except Exception as exc:
+            failed = True
             node_record["status"] = "failed"
             node_record["error"] = str(exc)
             node_record["error_type"] = type(exc).__name__
@@ -473,8 +425,9 @@ class ParallelNodeExecutorMixin:
             raise
         finally:
             node_record = run_state.state.setdefault("nodes", {}).setdefault(node["id"], {})
-            if node_record.get("status") not in {"success", "failed"}:
+            if not failed and node_record.get("status") not in {"success", "failed"}:
                 node_record["status"] = "success"
             node_record["finished_at_ms"] = engine._now_ms()
             node_record["duration_ms"] = node_record["finished_at_ms"] - node_record["started_at_ms"]
-            await engine._event("node.finished", run_state, node_id=node["id"], data=node_record)
+            if not failed:
+                await engine._event("node.finished", run_state, node_id=node["id"], data=node_record)

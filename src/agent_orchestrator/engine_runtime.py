@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
-from agent_orchestrator.models import RunState, StartRunRequest, WorkflowEvent
+from agent_orchestrator.models import RunState, StartRunRequest, WorkflowConfig, WorkflowEvent
 
 
 class EngineRuntimeMixin:
@@ -105,3 +105,25 @@ class EngineRuntimeMixin:
         result = self.error_observer(exc, run_state)
         if result is not None:
             await result
+
+    def _create_child_engine(
+        self,
+        child_workflow: WorkflowConfig,
+        *,
+        checkpoints: Any = None,
+    ) -> Any:
+        engine_factory = cast(Any, type(self))
+        return engine_factory(
+            child_workflow,
+            agents=self.agents,
+            tools=self.tools,
+            checkpoints=checkpoints if checkpoints is not None else self.checkpoints,
+            event_store=self.event_store,
+            artifact_store=self.artifact_store,
+            artifact_threshold_bytes=self.artifact_threshold_bytes,
+            pending_action_ttl_ms=self.pending_action_ttl_ms,
+            policy_gate=self.policy_gate,
+            raise_on_error=self.raise_on_error,
+            error_observer=self.error_observer,
+            observer=self.observer,
+        )

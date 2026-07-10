@@ -37,6 +37,7 @@ class RedisCheckpointStore(BaseCheckpointStore):
         client: Any | None = None,
         prefix: str = "agent-orchestrator",
         action_ttl_seconds: int | None = None,
+        run_ttl_seconds: int | None = None,
     ) -> None:
         if client is None:
             if Redis is None:
@@ -45,6 +46,7 @@ class RedisCheckpointStore(BaseCheckpointStore):
         self.client = client
         self.prefix = prefix.rstrip(":")
         self.action_ttl_seconds = action_ttl_seconds
+        self.run_ttl_seconds = run_ttl_seconds
 
     async def save_waiting(self, run_state: RunState, action: PendingAction) -> None:
         run_payload = _json_dumps(asdict(run_state))
@@ -55,6 +57,8 @@ class RedisCheckpointStore(BaseCheckpointStore):
         pipe.zadd(self._expiry_key(), {action.id: action.expires_at_ms or _NO_EXPIRY_SCORE})
         if self.action_ttl_seconds is not None:
             pipe.expire(self._action_key(action.id), self.action_ttl_seconds)
+        if self.run_ttl_seconds is not None:
+            pipe.expire(self._run_key(run_state.run_id), self.run_ttl_seconds)
         await pipe.execute()
 
     async def load_run(self, run_id: str) -> RunState:
@@ -79,7 +83,11 @@ class RedisCheckpointStore(BaseCheckpointStore):
         await pipe.execute()
 
     async def _mark_executed_once(self, pending_action_id: str) -> bool:
-        return bool(await self.client.set(self._executed_key(pending_action_id), _now_ms(), nx=True))
+        key = self._executed_key(pending_action_id)
+        result = bool(await self.client.set(key, _now_ms(), nx=True))
+        if result and self.action_ttl_seconds is not None:
+            await self.client.expire(key, self.action_ttl_seconds)
+        return result
 
     async def _acquire_run_lease(self, run_id: str, owner_id: str, ttl_ms: int) -> bool:
         return bool(
@@ -123,19 +131,7 @@ class RedisCheckpointStore(BaseCheckpointStore):
         action.status = "approved" if resolved_decision.get("decision") == "approve" else "rejected"
         action.decision = resolved_decision
         run_state = await self.load_run(action.run_id)
-        run_state.status = "running"
-        run_state.waiting_action_id = None
-        scheduler = run_state.state.setdefault("scheduler", {})
-        waiting_actions = scheduler.setdefault("waiting_actions", {})
-        waiting_actions.pop(pending_action_id, None)
-        node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
-        if action.action_type == "human":
-            node_record["status"] = "success"
-            node_record["output"] = resolved_decision
-            node_record.pop("_dag_outgoing_processed", None)
-        else:
-            node_record["status"] = "pending"
-            node_record["approval"] = resolved_decision
+        self._apply_resolution(run_state, action, pending_action_id, resolved_decision)
 
         if not hasattr(self.client, "eval"):
             pipe = self.client.pipeline(transaction=True)
@@ -176,7 +172,11 @@ class RedisCheckpointStore(BaseCheckpointStore):
         ids = await self.client.zrangebyscore(self._expiry_key(), min=0, max=now_ms)
         actions = []
         for action_id in ids:
-            action = await self.load_action(action_id)
+            try:
+                action = await self.load_action(action_id)
+            except WorkflowError:
+                await self.client.zrem(self._expiry_key(), action_id)
+                continue
             if action.status == "pending" and action.expires_at_ms is not None and action.expires_at_ms <= now_ms:
                 actions.append(action)
         return actions
@@ -207,6 +207,9 @@ class RedisCheckpointStore(BaseCheckpointStore):
     def _expiry_key(self) -> str:
         return f"{self.prefix}:actions:expiry"
 
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
 
 class RedisEventStore:
     """Redis event log store using per-run lists."""
@@ -218,6 +221,7 @@ class RedisEventStore:
         client: Any | None = None,
         prefix: str = "agent-orchestrator",
         max_events_per_run: int | None = None,
+        migration_registry: Any = None,
     ) -> None:
         if client is None:
             if Redis is None:
@@ -226,6 +230,7 @@ class RedisEventStore:
         self.client = client
         self.prefix = prefix.rstrip(":")
         self.max_events_per_run = max_events_per_run
+        self.migration_registry = migration_registry
 
     async def append(self, event: WorkflowEvent) -> None:
         key = self._events_key(event.run_id)
@@ -237,7 +242,7 @@ class RedisEventStore:
 
     async def list_by_run(self, run_id: str) -> list[WorkflowEvent]:
         rows = await self.client.lrange(self._events_key(run_id), 0, -1)
-        return [workflow_event_from_dict(json.loads(row)) for row in rows]
+        return [workflow_event_from_dict(json.loads(row), migration_registry=self.migration_registry) for row in rows]
 
     async def replace_run(self, run_id: str, events: list[WorkflowEvent]) -> None:
         key = self._events_key(run_id)
@@ -249,6 +254,9 @@ class RedisEventStore:
 
     def _events_key(self, run_id: str) -> str:
         return f"{self.prefix}:events:{run_id}"
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
 
 
 def _json_dumps(value: dict[str, Any]) -> str:

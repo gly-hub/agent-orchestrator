@@ -80,6 +80,15 @@ Nodes have types (`agent`, `tool`, `transform`, `human`, `condition`, `parallel`
 Node declaration order is only a stable listing order; execution dependencies
 must be expressed with explicit edges.
 
+**DAG Scheduling** — nodes with no incoming edges are entry nodes and may run
+concurrently. A node with multiple incoming edges is an implicit join. By default,
+it waits for all active incoming paths. Paths skipped by conditions do not block
+the join. Supported join policies:
+
+- `all_active` (default): wait for all active incoming paths
+- `all_success`: wait for all active incoming paths and require success
+- `any`: run after the first active incoming path completes
+
 **RunState** — the mutable state of a single workflow execution. Holds node
 outputs, context, status, scheduler state, edge activation state, and pending
 human actions.

@@ -91,6 +91,27 @@ class BaseCheckpointStore:
     async def _release_run_lease(self, run_id: str, owner_id: str) -> None:
         return None
 
+    @staticmethod
+    def _apply_resolution(
+        run_state: RunState,
+        action: PendingAction,
+        pending_action_id: str,
+        decision: dict,
+    ) -> None:
+        run_state.status = "running"
+        run_state.waiting_action_id = None
+        scheduler = run_state.state.setdefault("_internal", {}).setdefault("scheduler", {})
+        waiting_actions = scheduler.setdefault("waiting_actions", {})
+        waiting_actions.pop(pending_action_id, None)
+        node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
+        if action.action_type == "human":
+            node_record["status"] = "success"
+            node_record["output"] = decision
+            node_record.pop("_dag_outgoing_processed", None)
+        else:
+            node_record["status"] = "pending"
+            node_record["approval"] = decision
+
     async def expire_action(self, pending_action_id: str) -> PendingAction:
         action = await self.load_action(pending_action_id)
         if action.status == "pending":
@@ -121,19 +142,7 @@ class BaseCheckpointStore:
         await self._save_action(action)
 
         run_state = await self.load_run(action.run_id)
-        run_state.status = "running"
-        run_state.waiting_action_id = None
-        scheduler = run_state.state.setdefault("scheduler", {})
-        waiting_actions = scheduler.setdefault("waiting_actions", {})
-        waiting_actions.pop(pending_action_id, None)
-        node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
-        if action.action_type == "human":
-            node_record["status"] = "success"
-            node_record["output"] = decision
-            node_record.pop("_dag_outgoing_processed", None)
-        else:
-            node_record["status"] = "pending"
-            node_record["approval"] = decision
+        self._apply_resolution(run_state, action, pending_action_id, decision)
         return run_state
 
     def _resolve_timeout_decision(

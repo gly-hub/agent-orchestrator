@@ -72,6 +72,10 @@ the run emits `run.waiting`. `run.waiting` includes `pending_action_ids`, and
 also includes the legacy `pending_action_id` field when there is exactly one
 pending action.
 
+Internal scheduler state (edge activation status, ready/running queues, waiting
+actions) is stored under `state["_internal"]` and is not part of the user-facing
+state contract. Application code should not read or modify `_internal` entries.
+
 Supported join policies:
 
 - `all_active`: default; wait for all active incoming paths

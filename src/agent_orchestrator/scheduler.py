@@ -6,10 +6,10 @@ import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from dataclasses import replace
-from typing import Any, Protocol
+from dataclasses import dataclass, replace
+from typing import Any
 
+from agent_orchestrator.engine_protocol import EngineProtocol
 from agent_orchestrator.exceptions import WaitingForUser
 from agent_orchestrator.models import RunState, WorkflowConfig, WorkflowEvent
 from agent_orchestrator.state import evaluate_when
@@ -39,27 +39,6 @@ class _SchedulerResultItem:
 
 _SchedulerQueueItem = _SchedulerEventItem | _SchedulerResultItem
 
-
-class DagSchedulerEngine(Protocol):
-    execution: Any
-    raise_on_error: bool
-
-    async def _event(
-        self,
-        event_type: str,
-        run_state: RunState,
-        *,
-        node_id: str | None = None,
-        data: dict[str, Any] | None = None,
-    ) -> WorkflowEvent: ...
-
-    async def _run_node_with_retry(
-        self,
-        node: dict[str, Any],
-        run_state: RunState,
-    ) -> AsyncIterator[WorkflowEvent]: ...
-
-    async def _observe_run_failed(self, exc: Exception, run_state: RunState) -> None: ...
 
 
 class WorkflowGraph:
@@ -99,7 +78,7 @@ class DagScheduler:
 
     def __init__(
         self,
-        engine: DagSchedulerEngine,
+        engine: EngineProtocol,
         workflow: WorkflowConfig,
         nodes: dict[str, dict[str, Any]],
     ) -> None:
@@ -169,14 +148,15 @@ class DagScheduler:
                 exc,
             )
             await self.engine._observe_run_failed(exc, run_state)
-            yield await self.engine._run_failed_event(run_state, exc)  # type: ignore[attr-defined]
+            yield await self.engine._run_failed_event(run_state, exc)
             if self.engine.raise_on_error:
                 raise
 
     def _ensure_scheduler_state(self, run_state: RunState) -> None:
         run_state.state.setdefault("nodes", {})
-        edge_state = run_state.state.setdefault("edges", {})
-        scheduler = run_state.state.setdefault("scheduler", {})
+        internal = run_state.state.setdefault("_internal", {})
+        edge_state = internal.setdefault("edges", {})
+        scheduler = internal.setdefault("scheduler", {})
         scheduler.setdefault("entry_node_ids", list(self.graph.entry_node_ids))
         scheduler.setdefault("ready_node_ids", [])
         scheduler.setdefault("running_node_ids", [])
@@ -227,17 +207,13 @@ class DagScheduler:
         start_nodes(node_ids)
         try:
             while remaining:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=0.05)
-                except asyncio.TimeoutError:
-                    self._process_completed_nodes(run_state)
-                    start_nodes(self._ready_node_ids(run_state))
-                    continue
+                item = await queue.get()
                 if isinstance(item, _SchedulerEventItem):
                     yield item.event
                     continue
                 remaining -= 1
                 if item.error is not None:
+                    run_state.current_node_id = item.node_id
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -261,7 +237,7 @@ class DagScheduler:
         scheduler = self._scheduler(run_state)
         self._remove_once(scheduler["ready_node_ids"], node_id)
         scheduler["running_node_ids"].append(node_id)
-        self.engine.execution.start_node(run_state, node_id)
+        self.engine.execution.start_node(node_run_state, node_id)
         await self.engine.execution.observe_node_started(node_run_state, node_id)
         await queue.put(_SchedulerEventItem(await self.engine._event("node.started", node_run_state, node_id=node_id)))
 
@@ -284,15 +260,22 @@ class DagScheduler:
                     self._remove_once(scheduler["running_node_ids"], node_id)
                     await queue.put(_SchedulerResultItem(node_id=node_id, error=exc))
                     return
-                node_record = self.engine.execution.fail_node(run_state, node_id, exc)
+                node_record = self.engine.execution.fail_node(node_run_state, node_id, exc)
                 await self.engine.execution.observe_node_failed(node_run_state, node_id, node_record)
                 await queue.put(
                     _SchedulerEventItem(
                         await self.engine._event("node.failed", node_run_state, node_id=node_id, data=node_record)
                     )
                 )
+                node_record["finished_at_ms"] = self.engine.execution.now_ms()
+                node_record["duration_ms"] = node_record["finished_at_ms"] - node_record.get("started_at_ms", 0)
+                self._remove_once(scheduler["running_node_ids"], node_id)
+                scheduler["failed_node_ids"].append(node_id)
+                self._activate_outgoing_edges(run_state, node_id)
+                await queue.put(_SchedulerResultItem(node_id=node_id))
+                return
 
-            node_record = self.engine.execution.finish_node(run_state, node_id)
+            node_record = self.engine.execution.finish_node(node_run_state, node_id)
             await self.engine.execution.observe_node_finished(node_run_state, node_id, node_record)
             await queue.put(
                 _SchedulerEventItem(
@@ -410,8 +393,8 @@ class DagScheduler:
         waiting_actions: dict[str, Any],
     ) -> None:
         for action_id in waiting_actions:
-            action = await self.engine.checkpoints.load_action(action_id)  # type: ignore[attr-defined]
-            await self.engine.checkpoints.save_waiting(run_state, action)  # type: ignore[attr-defined]
+            action = await self.engine.checkpoints.load_action(action_id)
+            await self.engine.checkpoints.save_waiting(run_state, action)
 
     def _set_edge_status(
         self,
@@ -428,7 +411,7 @@ class DagScheduler:
         return run_state.state.setdefault("nodes", {}).setdefault(node_id, {"status": "pending"})
 
     def _edge_record(self, run_state: RunState, edge: SchedulerEdge) -> dict[str, Any]:
-        return run_state.state.setdefault("edges", {}).setdefault(
+        return run_state.state.setdefault("_internal", {}).setdefault("edges", {}).setdefault(
             edge.id,
             {
                 "from": edge.from_id,
@@ -439,7 +422,7 @@ class DagScheduler:
         )
 
     def _scheduler(self, run_state: RunState) -> dict[str, Any]:
-        return run_state.state.setdefault("scheduler", {})
+        return run_state.state.setdefault("_internal", {}).setdefault("scheduler", {})
 
     def _waiting_actions(self, run_state: RunState) -> dict[str, Any]:
         return self._scheduler(run_state).setdefault("waiting_actions", {})

@@ -245,7 +245,7 @@ async def test_file_event_store_applies_migration_on_read(tmp_path):
     """FileEventStore.list_by_run must pass migration_registry to
     workflow_event_from_dict so stored events are migrated on read."""
     from agent_orchestrator.events import FileEventStore
-    from agent_orchestrator.models import WorkflowEvent, workflow_event_to_dict
+    from agent_orchestrator.models import WorkflowEvent
 
     class MockMigrationRegistry:
         def __init__(self):

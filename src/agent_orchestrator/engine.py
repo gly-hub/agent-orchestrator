@@ -91,6 +91,10 @@ class WorkflowEngine(
             observer=self.observer,
         )
         self._nodes: dict[str, dict[str, Any]] = {node["id"]: dict(node) for node in workflow.nodes}
+        self._pending_action_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._resume_event_queues: dict[str, tuple[str, asyncio.Queue[WorkflowEvent | None]]] = {}
+        self._active_run_ids: set[str] = set()
+        self._live_waiting_action_ids: set[str] = set()
 
     async def start(self, request: StartRunRequest) -> AsyncIterator[WorkflowEvent]:
         run_state = self._new_run_state(request)
@@ -112,7 +116,46 @@ class WorkflowEngine(
             raise ValueError("pending_action_id and decision are required")
 
         logger.info("resuming pending action %s", pending_action_id)
+
+        action = await self.checkpoints.load_action(pending_action_id)
+        future = self._pending_action_futures.get(pending_action_id)
+        if (
+            future is not None
+            and not future.done()
+            and action.run_id in self._active_run_ids
+            and pending_action_id in self._live_waiting_action_ids
+        ):
+            run_state = await self.checkpoints.resolve_action(pending_action_id, decision)
+            queue: asyncio.Queue[WorkflowEvent | None] = asyncio.Queue()
+            self._resume_event_queues[pending_action_id] = (run_state.run_id, queue)
+            resolved_decision = run_state.state.get("nodes", {}).get(action.node_id, {}).get("output", decision)
+            future.set_result(resolved_decision)
+            yield await self._event(
+                "run.resumed",
+                run_state,
+                data={"pending_action_id": pending_action_id, "decision": resolved_decision},
+            )
+            try:
+                while True:
+                    event = await queue.get()
+                    if event is None:
+                        return
+                    yield event
+            finally:
+                self._resume_event_queues.pop(pending_action_id, None)
+            return
+
         run_state = await self.checkpoints.resolve_action(pending_action_id, decision)
+        self._pending_action_futures.pop(pending_action_id, None)
+        await self._wait_for_resume_handoff(run_state.run_id, pending_action_id)
+        if run_state.run_id in self._active_run_ids:
+            yield await self._event(
+                "run.resumed",
+                run_state,
+                data={"pending_action_id": pending_action_id, "decision": decision},
+            )
+            return
+
         async for event in self._advance_public_run(
             run_state,
             initial_event_type="run.resumed",
@@ -127,6 +170,7 @@ class WorkflowEngine(
         initial_event_type: str,
         initial_data: dict[str, Any] | None = None,
     ) -> AsyncIterator[WorkflowEvent]:
+        self._active_run_ids.add(run_state.run_id)
         try:
             if self.run_lease_ttl_ms is None:
                 yield await self._event(initial_event_type, run_state, data=initial_data)
@@ -156,6 +200,8 @@ class WorkflowEngine(
             )
             if self.raise_on_error:
                 raise
+        finally:
+            self._active_run_ids.discard(run_state.run_id)
 
     async def resume_expired_action(
         self,
@@ -196,6 +242,30 @@ class WorkflowEngine(
         scheduler = DagScheduler(self, self.workflow, self._nodes)
         async for event in scheduler.run(run_state):
             yield event
+
+    async def _wait_for_resume_handoff(self, run_id: str, pending_action_id: str) -> None:
+        if run_id not in self._active_run_ids:
+            return
+        if pending_action_id in self._live_waiting_action_ids:
+            return
+
+        deadline = asyncio.get_running_loop().time() + 0.2
+        while run_id in self._active_run_ids and pending_action_id not in self._live_waiting_action_ids:
+            if asyncio.get_running_loop().time() >= deadline:
+                return
+            await asyncio.sleep(0.01)
+
+    def _publish_resume_event(self, event: WorkflowEvent) -> None:
+        if not self._resume_event_queues:
+            return
+        for run_id, queue in list(self._resume_event_queues.values()):
+            if run_id == event.run_id:
+                queue.put_nowait(event)
+
+    def _close_resume_event_queues(self, run_id: str) -> None:
+        for queued_run_id, queue in list(self._resume_event_queues.values()):
+            if queued_run_id == run_id:
+                queue.put_nowait(None)
 
     async def _run_node_with_retry(
         self,

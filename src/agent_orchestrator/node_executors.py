@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -10,7 +11,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
-from agent_orchestrator.exceptions import PermissionDenied
+from agent_orchestrator.exceptions import PermissionDenied, WaitingForUser
 from agent_orchestrator.models import PendingAction, RunState, ToolDefinition, WorkflowEvent
 from agent_orchestrator.schema import validate_schema_value
 from agent_orchestrator.state import evaluate_when, render_template
@@ -257,6 +258,19 @@ class BasicNodeExecutorMixin:
             created_at_ms=self._now_ms(),
             expires_at_ms=self._expires_at_ms(),
         )
+        loop = asyncio.get_running_loop()
+        self._pending_action_futures[action.id] = loop.create_future()
+        run_state.status = "waiting_for_user"
+        run_state.waiting_action_id = action.id
+        node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
+        node_record["status"] = "waiting"
+        scheduler = run_state.state.setdefault("_internal", {}).setdefault("scheduler", {})
+        waiting_actions = scheduler.setdefault("waiting_actions", {})
+        waiting_actions[action.id] = {
+            "node_id": action.node_id,
+            "action_type": action.action_type,
+        }
+        await self.checkpoints.save_waiting(run_state, action)
         logger.debug("human node %s creating pending action %s", node["id"], action.id)
         yield await self._event(
             "human.required",
@@ -267,4 +281,4 @@ class BasicNodeExecutorMixin:
                 "request": action.request,
             },
         )
-        await self._pause_for_action(run_state, action)
+        raise WaitingForUser(action.id)

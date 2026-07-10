@@ -185,6 +185,7 @@ async def test_parallel_node_cancels_branch_tasks_when_stream_closes():
     stream = engine.start(StartRunRequest(message="go")).__aiter__()
 
     assert (await anext(stream)).type == "run.started"
+    assert (await anext(stream)).type == "node.ready"
     assert (await anext(stream)).type == "node.started"
     assert (await anext(stream)).type == "node.started"
     await asyncio.wait_for(branch_started.wait(), timeout=1)

@@ -99,7 +99,16 @@ class DagScheduler:
 
         try:
             while True:
-                self._process_completed_nodes(run_state)
+                edge_updates = self._process_completed_nodes(run_state)
+                for data in edge_updates:
+                    event = await self.engine._event(
+                        "edge.updated",
+                        run_state,
+                        node_id=data["from"],
+                        data=data,
+                    )
+                    self.engine._publish_resume_event(event)
+                    yield event
                 ready = self._ready_node_ids(run_state)
                 if ready:
                     async for event in self._run_ready_nodes(run_state, ready):
@@ -143,7 +152,17 @@ class DagScheduler:
                     self.engine._close_resume_event_queues(run_state.run_id)
                     return
 
-                if self._mark_unactivated_pending_nodes_skipped(run_state):
+                skipped_changed, edge_updates = self._mark_unactivated_pending_nodes_skipped(run_state)
+                for data in edge_updates:
+                    event = await self.engine._event(
+                        "edge.updated",
+                        run_state,
+                        node_id=data["from"],
+                        data=data,
+                    )
+                    self.engine._publish_resume_event(event)
+                    yield event
+                if skipped_changed:
                     continue
                 run_state.status = "completed"
                 logger.info("run %s completed", run_state.run_id)
@@ -222,7 +241,7 @@ class DagScheduler:
         waiting_nodes: set[str] = set()
         waiting_emitted = False
 
-        def start_nodes(start_node_ids: list[str]) -> None:
+        async def start_nodes(start_node_ids: list[str]) -> None:
             nonlocal remaining
             for node_id in start_node_ids:
                 record = self._node_record(run_state, node_id)
@@ -230,6 +249,16 @@ class DagScheduler:
                     continue
                 record["status"] = "ready"
                 self._scheduler(run_state)["ready_node_ids"].append(node_id)
+                await queue.put(
+                    _SchedulerEventItem(
+                        await self.engine._event(
+                            "node.ready",
+                            replace(run_state, current_node_id=node_id),
+                            node_id=node_id,
+                            data=self._node_ready_event_data(run_state, node_id),
+                        )
+                    )
+                )
                 tasks.append(
                     asyncio.create_task(
                         self._run_one_node(node_id, run_state, queue),
@@ -271,7 +300,7 @@ class DagScheduler:
             self.engine._publish_resume_event(event)
             return event
 
-        start_nodes(node_ids)
+        await start_nodes(node_ids)
         try:
             while remaining:
                 item = await queue.get()
@@ -313,8 +342,18 @@ class DagScheduler:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
                     raise item.error
-                self._process_completed_nodes(run_state)
-                start_nodes(self._ready_node_ids(run_state))
+                for data in self._process_completed_nodes(run_state):
+                    await queue.put(
+                        _SchedulerEventItem(
+                            await self.engine._event(
+                                "edge.updated",
+                                run_state,
+                                node_id=data["from"],
+                                data=data,
+                            )
+                        )
+                    )
+                await start_nodes(self._ready_node_ids(run_state))
                 if waiting_for_human == remaining and not waiting_emitted:
                     event = await emit_waiting_if_only_humans_remain()
                     if event is not None:
@@ -386,7 +425,17 @@ class DagScheduler:
                 node_record["duration_ms"] = node_record["finished_at_ms"] - node_record.get("started_at_ms", 0)
                 self._remove_once(scheduler["running_node_ids"], node_id)
                 scheduler["failed_node_ids"].append(node_id)
-                self._activate_outgoing_edges(run_state, node_id)
+                for data in self._activate_outgoing_edges(run_state, node_id):
+                    await queue.put(
+                        _SchedulerEventItem(
+                            await self.engine._event(
+                                "edge.updated",
+                                node_run_state,
+                                node_id=data["from"],
+                                data=data,
+                            )
+                        )
+                    )
                 await queue.put(_SchedulerResultItem(node_id=node_id))
                 return
 
@@ -402,7 +451,17 @@ class DagScheduler:
                 scheduler["failed_node_ids"].append(node_id)
             else:
                 scheduler["completed_node_ids"].append(node_id)
-            self._activate_outgoing_edges(run_state, node_id)
+            for data in self._activate_outgoing_edges(run_state, node_id):
+                await queue.put(
+                    _SchedulerEventItem(
+                        await self.engine._event(
+                            "edge.updated",
+                            node_run_state,
+                            node_id=data["from"],
+                            data=data,
+                        )
+                    )
+                )
             await queue.put(_SchedulerResultItem(node_id=node_id))
         except Exception as exc:
             self._remove_once(scheduler["running_node_ids"], node_id)
@@ -450,7 +509,17 @@ class DagScheduler:
 
         scheduler = self._scheduler(run_state)
         scheduler["completed_node_ids"].append(node_id)
-        self._activate_outgoing_edges(run_state, node_id)
+        for data in self._activate_outgoing_edges(run_state, node_id):
+            await queue.put(
+                _SchedulerEventItem(
+                    await self.engine._event(
+                        "edge.updated",
+                        node_run_state,
+                        node_id=data["from"],
+                        data=data,
+                    )
+                )
+            )
         await queue.put(_SchedulerResultItem(node_id=node_id))
 
     async def _wait_for_pending_action_resolution(
@@ -478,33 +547,43 @@ class DagScheduler:
         action = await self.engine.checkpoints.load_action(pending_action_id)
         await self.engine.checkpoints.save_waiting(run_state, action)
 
-    def _process_completed_nodes(self, run_state: RunState) -> None:
+    def _process_completed_nodes(self, run_state: RunState) -> list[dict[str, Any]]:
+        edge_updates: list[dict[str, Any]] = []
         for node_id in self.graph.node_ids:
             record = self._node_record(run_state, node_id)
             if record.get("_dag_outgoing_processed"):
                 continue
             if record.get("status") in {"success", "failed"}:
-                self._activate_outgoing_edges(run_state, node_id)
+                edge_updates.extend(self._activate_outgoing_edges(run_state, node_id))
+        return edge_updates
 
-    def _activate_outgoing_edges(self, run_state: RunState, node_id: str) -> None:
+    def _activate_outgoing_edges(self, run_state: RunState, node_id: str) -> list[dict[str, Any]]:
         record = self._node_record(run_state, node_id)
         if record.get("_dag_outgoing_processed"):
-            return
+            return []
 
         failed = record.get("status") == "failed"
+        edge_updates: list[dict[str, Any]] = []
         for edge in self.graph.outgoing.get(node_id, []):
             is_error_edge = bool(edge.data.get("on_error"))
             if failed != is_error_edge:
-                self._set_edge_status(run_state, edge, "skipped", "status_mismatch")
+                update = self._set_edge_status(run_state, edge, "skipped", "status_mismatch")
+                if update is not None:
+                    edge_updates.append(update)
                 continue
             if evaluate_when(edge.data.get("when"), run_state.state):
-                self._set_edge_status(run_state, edge, "active", None)
+                update = self._set_edge_status(run_state, edge, "active", None)
+                if update is not None:
+                    edge_updates.append(update)
                 target = self._node_record(run_state, edge.to_id)
                 target["activated"] = True
             else:
-                self._set_edge_status(run_state, edge, "skipped", "when_false")
+                update = self._set_edge_status(run_state, edge, "skipped", "when_false")
+                if update is not None:
+                    edge_updates.append(update)
 
         record["_dag_outgoing_processed"] = True
+        return edge_updates
 
     def _ready_node_ids(self, run_state: RunState) -> list[str]:
         ready: list[str] = []
@@ -552,9 +631,10 @@ class DagScheduler:
                 return False
         return saw_active_input
 
-    def _mark_unactivated_pending_nodes_skipped(self, run_state: RunState) -> bool:
+    def _mark_unactivated_pending_nodes_skipped(self, run_state: RunState) -> tuple[bool, list[dict[str, Any]]]:
         scheduler = self._scheduler(run_state)
         changed = False
+        edge_updates: list[dict[str, Any]] = []
         for node_id in self.graph.node_ids:
             record = self._node_record(run_state, node_id)
             if record.get("status", "pending") != "pending" or record.get("activated"):
@@ -569,8 +649,10 @@ class DagScheduler:
                 scheduler["skipped_node_ids"].append(node_id)
                 changed = True
                 for edge in self.graph.outgoing.get(node_id, []):
-                    self._set_edge_status(run_state, edge, "skipped", "source_skipped")
-        return changed
+                    update = self._set_edge_status(run_state, edge, "skipped", "source_skipped")
+                    if update is not None:
+                        edge_updates.append(update)
+        return changed, edge_updates
 
     async def _save_waiting_checkpoint(
         self,
@@ -587,10 +669,50 @@ class DagScheduler:
         edge: SchedulerEdge,
         status: str,
         reason: str | None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         edge_record = self._edge_record(run_state, edge)
+        if edge_record.get("status") == status and edge_record.get("reason") == reason:
+            return None
         edge_record["status"] = status
         edge_record["reason"] = reason
+        return self._edge_event_data(run_state, edge, edge_record)
+
+    def _edge_event_data(
+        self,
+        run_state: RunState,
+        edge: SchedulerEdge,
+        edge_record: dict[str, Any],
+    ) -> dict[str, Any]:
+        predecessor = self._node_record(run_state, edge.from_id)
+        successor = self._node_record(run_state, edge.to_id)
+        return {
+            "edge_id": edge.id,
+            "from": edge.from_id,
+            "to": edge.to_id,
+            "status": edge_record.get("status"),
+            "reason": edge_record.get("reason"),
+            "from_status": predecessor.get("status", "pending"),
+            "to_status": successor.get("status", "pending"),
+        }
+
+    def _node_ready_event_data(self, run_state: RunState, node_id: str) -> dict[str, Any]:
+        incoming_edges = self.graph.incoming.get(node_id, [])
+        incoming = [
+            self._edge_event_data(run_state, edge, self._edge_record(run_state, edge))
+            for edge in incoming_edges
+        ]
+        triggered_edges = [
+            edge_data
+            for edge_data in incoming
+            if edge_data.get("status") == "active"
+        ]
+        return {
+            "node_id": node_id,
+            "join_policy": self.nodes[node_id].get("join_policy", "all_active"),
+            "triggered_by_node_ids": [edge_data["from"] for edge_data in triggered_edges],
+            "triggered_by_edge_ids": [edge_data["edge_id"] for edge_data in triggered_edges],
+            "incoming": incoming,
+        }
 
     def _node_record(self, run_state: RunState, node_id: str) -> dict[str, Any]:
         return run_state.state.setdefault("nodes", {}).setdefault(node_id, {"status": "pending"})

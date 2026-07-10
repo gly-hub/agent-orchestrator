@@ -258,6 +258,7 @@ async def test_timeout_preserves_streaming_node_events():
 
     try:
         assert (await anext(stream)).type == "run.started"
+        assert (await anext(stream)).type == "node.ready"
         assert (await anext(stream)).type == "node.started"
         delta = await asyncio.wait_for(anext(stream), timeout=0.05)
         assert delta.type == "agent.delta"

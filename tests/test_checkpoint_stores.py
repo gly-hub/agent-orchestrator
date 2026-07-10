@@ -72,13 +72,14 @@ async def test_checkpoint_save_failure_returns_failed_terminal_event():
 
     assert [event.type for event in events] == [
         "run.started",
+        "node.ready",
         "node.started",
         "human.required",
         "run.failed",
     ]
     assert events[-1].data["error_type"] == "RuntimeError"
     assert "checkpoint unavailable" in events[-1].data["error"]
-    pending_action_id = events[2].data["pending_action_id"]
+    pending_action_id = events[3].data["pending_action_id"]
     with pytest.raises(WorkflowError, match="pending action not found"):
         await checkpoints.load_action(pending_action_id)
 

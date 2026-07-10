@@ -778,3 +778,162 @@ async def test_resume_recovers_when_start_stream_closed_after_human_required():
         event.type == "node.finished" and event.node_id == "join"
         for event in resumed_events
     )
+
+
+async def test_node_ready_event_describes_join_predecessors():
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "dag-ready-trace",
+            "version": 1,
+            "nodes": [
+                {"id": "a", "type": "transform", "output": {"value": "a"}},
+                {"id": "b", "type": "transform", "output": {"value": "b"}},
+                {
+                    "id": "join",
+                    "type": "transform",
+                    "input": {
+                        "a": "{{nodes.a.output.value}}",
+                        "b": "{{nodes.b.output.value}}",
+                    },
+                },
+            ],
+            "edges": [
+                {"id": "edge:a-join", "from": "a", "to": "join"},
+                {"id": "edge:b-join", "from": "b", "to": "join"},
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools)
+
+    events = [event async for event in engine.start(StartRunRequest(message="go"))]
+
+    join_ready_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type == "node.ready" and event.node_id == "join"
+    )
+    join_started_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type == "node.started" and event.node_id == "join"
+    )
+    assert join_ready_index < join_started_index
+
+    ready = events[join_ready_index]
+    assert ready.data["join_policy"] == "all_active"
+    assert ready.data["triggered_by_node_ids"] == ["a", "b"]
+    assert ready.data["triggered_by_edge_ids"] == ["edge:a-join", "edge:b-join"]
+    assert ready.data["incoming"] == [
+        {
+            "edge_id": "edge:a-join",
+            "from": "a",
+            "to": "join",
+            "status": "active",
+            "reason": None,
+            "from_status": "success",
+            "to_status": "ready",
+        },
+        {
+            "edge_id": "edge:b-join",
+            "from": "b",
+            "to": "join",
+            "status": "active",
+            "reason": None,
+            "from_status": "success",
+            "to_status": "ready",
+        },
+    ]
+
+
+async def test_edge_updated_events_describe_condition_branch_edges():
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "dag-edge-trace",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "route",
+                    "type": "condition",
+                    "input": {"kind": "{{context.kind}}"},
+                    "cases": [
+                        {"when": "{{input.kind}} == 'vip'", "value": "vip"},
+                        {"when": "{{input.kind}} == 'normal'", "value": "normal"},
+                    ],
+                },
+                {"id": "vip", "type": "transform", "output": {"path": "vip"}},
+                {"id": "normal", "type": "transform", "output": {"path": "normal"}},
+            ],
+            "edges": [
+                {
+                    "id": "edge:route-vip",
+                    "from": "route",
+                    "to": "vip",
+                    "when": "{{nodes.route.output.value}} == 'vip'",
+                },
+                {
+                    "id": "edge:route-normal",
+                    "from": "route",
+                    "to": "normal",
+                    "when": "{{nodes.route.output.value}} == 'normal'",
+                },
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools)
+
+    events = [
+        event
+        async for event in engine.start(StartRunRequest(message="go", context={"kind": "vip"}))
+    ]
+
+    edge_events = {
+        event.data["edge_id"]: event.data
+        for event in events
+        if event.type == "edge.updated"
+    }
+    assert {
+        key: edge_events["edge:route-vip"][key]
+        for key in {
+            "edge_id",
+            "from",
+            "to",
+            "status",
+            "reason",
+            "from_status",
+            "to_status",
+        }
+    } == {
+        "edge_id": "edge:route-vip",
+        "from": "route",
+        "to": "vip",
+        "status": "active",
+        "reason": None,
+        "from_status": "success",
+        "to_status": "pending",
+    }
+    assert {
+        key: edge_events["edge:route-normal"][key]
+        for key in {
+            "edge_id",
+            "from",
+            "to",
+            "status",
+            "reason",
+            "from_status",
+            "to_status",
+        }
+    } == {
+        "edge_id": "edge:route-normal",
+        "from": "route",
+        "to": "normal",
+        "status": "skipped",
+        "reason": "when_false",
+        "from_status": "success",
+        "to_status": "pending",
+    }

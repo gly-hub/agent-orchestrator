@@ -58,8 +58,8 @@ def core_persistence_plugins() -> PersistencePluginRegistry:
     registry.checkpoints.register("memory", lambda config: InMemoryCheckpointStore())
     registry.checkpoints.register("file", lambda config: FileCheckpointStore(_require_root(config)))
     registry.events.register("noop", lambda config: NoopEventStore())
-    registry.events.register("memory", lambda config: InMemoryEventStore())
-    registry.events.register("file", lambda config: FileEventStore(_require_root(config)))
+    registry.events.register("memory", lambda config: InMemoryEventStore(migration_registry=config.get("migration_registry")))
+    registry.events.register("file", lambda config: FileEventStore(_require_root(config), migration_registry=config.get("migration_registry")))
     registry.artifacts.register("memory", lambda config: InMemoryArtifactStore())
     registry.artifacts.register("file", lambda config: FileArtifactStore(_require_root(config)))
     return registry

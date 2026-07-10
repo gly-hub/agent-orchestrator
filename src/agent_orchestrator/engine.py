@@ -28,7 +28,7 @@ from agent_orchestrator.parallel import ParallelNodeExecutorMixin
 from agent_orchestrator.policy import DefaultToolPolicyGate, ToolPolicyGate
 from agent_orchestrator.registry import AgentRegistry, ToolRegistry
 from agent_orchestrator.retry import retry_delay_ms, should_retry
-from agent_orchestrator.router import WorkflowRouter
+from agent_orchestrator.scheduler import DagScheduler
 from agent_orchestrator.subflow import SubflowNodeExecutorMixin
 from agent_orchestrator.validation import validate_workflow_config
 
@@ -91,7 +91,6 @@ class WorkflowEngine(
             observer=self.observer,
         )
         self._nodes: dict[str, dict[str, Any]] = {node["id"]: dict(node) for node in workflow.nodes}
-        self._router = WorkflowRouter(workflow)
 
     async def start(self, request: StartRunRequest) -> AsyncIterator[WorkflowEvent]:
         run_state = self._new_run_state(request)
@@ -194,66 +193,9 @@ class WorkflowEngine(
         return events
 
     async def _continue(self, run_state: RunState) -> AsyncIterator[WorkflowEvent]:
-        node_id = self._router.next_node_id(run_state)
-
-        try:
-            while node_id:
-                node = self._nodes[node_id]
-                self.execution.start_node(run_state, node_id)
-                await self.execution.observe_node_started(run_state, node_id)
-                yield await self._event("node.started", run_state, node_id=node_id)
-
-                try:
-                    async for event in self._run_node_with_retry(node, run_state):
-                        yield event
-                except WaitingForUser:
-                    raise
-                except Exception as exc:
-                    if not self._router.has_error_edge(node_id):
-                        raise
-                    node_record = self.execution.fail_node(run_state, node_id, exc)
-                    await self.execution.observe_node_failed(run_state, node_id, node_record)
-                    yield await self._event(
-                        "node.failed",
-                        run_state,
-                        node_id=node_id,
-                        data=node_record,
-                    )
-
-                node_record = self.execution.finish_node(run_state, node_id)
-                await self.execution.observe_node_finished(run_state, node_id, node_record)
-                yield await self._event("node.finished", run_state, node_id=node_id, data=node_record)
-                node_id = self._router.next_node_id(run_state)
-
-            run_state.status = "completed"
-            logger.info("run %s completed", run_state.run_id)
-            yield await self._event("run.finished", run_state)
-        except WaitingForUser as exc:
-            run_state.status = "waiting_for_user"
-            run_state.waiting_action_id = exc.pending_action_id
-            logger.info("run %s waiting for user action %s", run_state.run_id, exc.pending_action_id)
-            await self.execution.observe(
-                "run.waiting",
-                run_state,
-                node_id=run_state.current_node_id,
-                data={"pending_action_id": exc.pending_action_id},
-            )
-            yield await self._event(
-                "run.waiting",
-                run_state,
-                node_id=run_state.current_node_id,
-                data={"pending_action_id": exc.pending_action_id},
-            )
-        except Exception as exc:
-            run_state.status = "failed"
-            logger.error("run %s failed at node %s: %s", run_state.run_id, run_state.current_node_id, exc)
-            await self._observe_run_failed(exc, run_state)
-            yield await self._run_failed_event(
-                run_state,
-                exc,
-            )
-            if self.raise_on_error:
-                raise
+        scheduler = DagScheduler(self, self.workflow, self._nodes)
+        async for event in scheduler.run(run_state):
+            yield event
 
     async def _run_node_with_retry(
         self,
@@ -378,5 +320,11 @@ class WorkflowEngine(
         run_state.waiting_action_id = action.id
         node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
         node_record["status"] = "waiting"
+        scheduler = run_state.state.setdefault("_internal", {}).setdefault("scheduler", {})
+        waiting_actions = scheduler.setdefault("waiting_actions", {})
+        waiting_actions[action.id] = {
+            "node_id": action.node_id,
+            "action_type": action.action_type,
+        }
         await self.checkpoints.save_waiting(run_state, action)
         raise WaitingForUser(action.id)

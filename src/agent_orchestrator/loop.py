@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
+from agent_orchestrator.engine_protocol import EngineProtocol
 from agent_orchestrator.exceptions import WorkflowError
 from agent_orchestrator.models import RunState, WorkflowConfig, WorkflowEvent
 from agent_orchestrator.runtime import EVENT_BUFFER, drain
@@ -17,48 +18,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 100
 
 
-class _LoopEngine(Protocol):
-    agents: Any
-    tools: Any
-    checkpoints: Any
-    event_store: Any
-    artifact_store: Any
-    artifact_threshold_bytes: int | None
-    pending_action_ttl_ms: int | None
-    policy_gate: Any
-    raise_on_error: bool
-    error_observer: Any
-    observer: Any
-
-    async def _render_node_value(
-        self,
-        node: dict[str, Any],
-        run_state: RunState,
-        value: Any,
-    ) -> Any: ...
-
-    async def _save_node_output(
-        self,
-        run_state: RunState,
-        node_id: str,
-        output: Any,
-        *,
-        node: dict[str, Any],
-    ) -> None: ...
-
-    async def _event(
-        self,
-        event_type: str,
-        run_state: RunState,
-        *,
-        node_id: str | None = None,
-        data: dict[str, Any] | None = None,
-    ) -> WorkflowEvent: ...
-
-    async def _record_event(self, event: WorkflowEvent) -> WorkflowEvent: ...
-
-    def _continue(self, run_state: RunState) -> AsyncIterator[WorkflowEvent]: ...
-
 
 class LoopNodeExecutorMixin:
     """Executor for loop workflow nodes that repeat a body while a condition holds."""
@@ -68,7 +27,7 @@ class LoopNodeExecutorMixin:
         node: dict[str, Any],
         run_state: RunState,
     ) -> AsyncIterator[WorkflowEvent]:
-        engine = cast(_LoopEngine, self)
+        engine = cast(EngineProtocol, self)
         max_iterations = int(node.get("max_iterations", DEFAULT_MAX_ITERATIONS))
         condition = node.get("condition")
         body_data = node.get("body")
@@ -101,8 +60,8 @@ class LoopNodeExecutorMixin:
             token = EVENT_BUFFER.set(buffer)
             error: Exception | None = None
             try:
-                child_engine = self._create_child_engine(engine, child_workflow)
-                child_runtime = cast(_LoopEngine, child_engine)
+                child_engine = cast(EngineProtocol, self)._create_child_engine(child_workflow)
+                child_runtime = cast(EngineProtocol, child_engine)
                 await drain(child_runtime._continue(child_state))
             except Exception as exc:
                 error = exc
@@ -202,23 +161,6 @@ class LoopNodeExecutorMixin:
             },
         )
         return child_state, child_workflow
-
-    def _create_child_engine(self, engine: Any, child_workflow: WorkflowConfig) -> Any:
-        engine_factory = type(cast(Any, self))
-        return engine_factory(
-            child_workflow,
-            agents=engine.agents,
-            tools=engine.tools,
-            checkpoints=engine.checkpoints,
-            event_store=engine.event_store,
-            artifact_store=engine.artifact_store,
-            artifact_threshold_bytes=engine.artifact_threshold_bytes,
-            pending_action_ttl_ms=engine.pending_action_ttl_ms,
-            policy_gate=engine.policy_gate,
-            raise_on_error=engine.raise_on_error,
-            error_observer=engine.error_observer,
-            observer=engine.observer,
-        )
 
     def _namespace_loop_event(
         self,

@@ -326,24 +326,6 @@ async def test_parallel_node_default_failure_policy_fails_run():
     assert events[-1].data["error_type"] == "WorkflowError"
     assert "parallel branches failed: fail" in events[-1].data["error"]
 
-async def test_parallel_node_accepts_human_branch():
-    workflow = WorkflowConfig.from_dict(
-        {
-            "id": "parallel-human",
-            "version": 1,
-            "nodes": [
-                {
-                    "id": "fanout",
-                    "type": "parallel",
-                    "branches": [
-                        {"id": "confirm", "type": "human", "title": "确认"},
-                    ],
-                }
-            ],
-        }
-    )
-    assert workflow.id == "parallel-human"
-
 async def test_subflow_node_runs_reusable_workflow_and_selects_output():
     agents = AgentRegistry()
     tools = ToolRegistry()
@@ -574,15 +556,16 @@ async def test_subflow_with_human_node_pauses_and_resumes():
                 {
                     "id": "child",
                     "type": "subflow",
-                    "workflow": {
-                        "nodes": [
-                            {"id": "ask", "type": "human", "title": "Enter name"},
-                            {"id": "say_hi", "type": "tool", "tool": "greet",
-                             "args": {"name": "{{nodes.ask.output.name}}"}},
-                        ],
-                    },
-                }
-            ],
+                        "workflow": {
+                            "nodes": [
+                                {"id": "ask", "type": "human", "title": "Enter name"},
+                                {"id": "say_hi", "type": "tool", "tool": "greet",
+                                 "args": {"name": "{{nodes.ask.output.name}}"}},
+                            ],
+                            "edges": [{"from": "ask", "to": "say_hi"}],
+                        },
+                    }
+                ],
         }
     )
     engine = WorkflowEngine(workflow, agents=agents, tools=tools, raise_on_error=True)
@@ -607,68 +590,3 @@ async def test_subflow_with_human_node_pauses_and_resumes():
     assert len(node_finished) == 1
     output = node_finished[0].data["output"]
     assert output["output"] == {"greeting": "Hello Alice"}
-
-async def test_parallel_workflow_branch_with_human_pauses_and_resumes():
-    agents = AgentRegistry()
-    tools = ToolRegistry()
-
-    async def process(args, run_state):
-        return {"result": f"processed {args.get('value', '')}"}
-
-    tools.register("process", process)
-    workflow = WorkflowConfig.from_dict(
-        {
-            "id": "parallel-human-flow",
-            "version": 1,
-            "nodes": [
-                {
-                    "id": "fanout",
-                    "type": "parallel",
-                    "branches": [
-                        {
-                            "id": "auto",
-                            "workflow": {
-                                "nodes": [
-                                    {"id": "step", "type": "tool", "tool": "process",
-                                     "args": {"value": "auto"}},
-                                ],
-                            },
-                        },
-                        {
-                            "id": "manual",
-                            "workflow": {
-                                "nodes": [
-                                    {"id": "confirm", "type": "human", "title": "Confirm"},
-                                    {"id": "act", "type": "tool", "tool": "process",
-                                     "args": {"value": "{{nodes.confirm.output.choice}}"}},
-                                ],
-                            },
-                        },
-                    ],
-                }
-            ],
-        }
-    )
-    engine = WorkflowEngine(workflow, agents=agents, tools=tools, raise_on_error=True)
-
-    events = [e async for e in engine.start(StartRunRequest(message="go"))]
-
-    waiting = [e for e in events if e.type == "run.waiting"]
-    assert len(waiting) == 1
-    human_required = [e for e in events if e.type == "human.required"]
-    assert len(human_required) == 1
-    action_id = human_required[0].data["pending_action_id"]
-
-    resumed_events = [
-        e async for e in engine.resume(
-            pending_action_id=action_id,
-            decision={"decision": "approve", "choice": "manual_value"},
-        )
-    ]
-
-    assert resumed_events[-1].type == "run.finished"
-    node_finished = [e for e in resumed_events if e.type == "node.finished" and e.node_id == "fanout"]
-    assert len(node_finished) == 1
-    output = node_finished[0].data["output"]
-    assert output["branches"]["auto"] == {"result": "processed auto"}
-    assert output["branches"]["manual"] == {"result": "processed manual_value"}

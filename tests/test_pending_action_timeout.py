@@ -112,6 +112,13 @@ async def test_resume_expired_actions_applies_on_timeout_decision():
                     },
                 },
             ],
+            "edges": [
+                {
+                    "from": "confirm",
+                    "to": "timeout_handler",
+                    "when": "{{nodes.confirm.output.decision}} == 'timeout'",
+                }
+            ],
         }
     )
     engine = WorkflowEngine(

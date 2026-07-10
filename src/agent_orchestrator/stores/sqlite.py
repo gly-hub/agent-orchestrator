@@ -6,6 +6,8 @@ import asyncio
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -34,40 +36,46 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         await asyncio.to_thread(self._save_waiting_sync, run_state, action)
 
     def _save_waiting_sync(self, run_state: RunState, action: PendingAction) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO runs(run_id, payload, updated_at_ms)
-                VALUES(?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    payload = excluded.payload,
-                    updated_at_ms = excluded.updated_at_ms
-                """,
-                (
-                    run_state.run_id,
-                    _json_dumps(asdict(run_state)),
-                    _now_ms(),
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO actions(action_id, run_id, status, expires_at_ms, payload, updated_at_ms)
-                VALUES(?, ?, ?, ?, ?, ?)
-                ON CONFLICT(action_id) DO UPDATE SET
-                    run_id = excluded.run_id,
-                    status = excluded.status,
-                    expires_at_ms = excluded.expires_at_ms,
-                    payload = excluded.payload,
-                    updated_at_ms = excluded.updated_at_ms
-                """,
-                _action_row(action),
-            )
+        with self._open() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO runs(run_id, payload, updated_at_ms)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        payload = excluded.payload,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        run_state.run_id,
+                        _json_dumps(asdict(run_state)),
+                        _now_ms(),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO actions(action_id, run_id, status, expires_at_ms, payload, updated_at_ms)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(action_id) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        status = excluded.status,
+                        expires_at_ms = excluded.expires_at_ms,
+                        payload = excluded.payload,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    _action_row(action),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     async def load_run(self, run_id: str) -> RunState:
         return await asyncio.to_thread(self._load_run_sync, run_id)
 
     def _load_run_sync(self, run_id: str) -> RunState:
-        with self._connect() as conn:
+        with self._open() as conn:
             row = conn.execute(
                 "SELECT payload FROM runs WHERE run_id = ?",
                 (run_id,),
@@ -80,7 +88,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         return await asyncio.to_thread(self._load_action_sync, pending_action_id)
 
     def _load_action_sync(self, pending_action_id: str) -> PendingAction:
-        with self._connect() as conn:
+        with self._open() as conn:
             row = conn.execute(
                 "SELECT payload FROM actions WHERE action_id = ?",
                 (pending_action_id,),
@@ -93,7 +101,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         await asyncio.to_thread(self._save_action_sync, action)
 
     def _save_action_sync(self, action: PendingAction) -> None:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.execute(
                 """
                 INSERT INTO actions(action_id, run_id, status, expires_at_ms, payload, updated_at_ms)
@@ -113,7 +121,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
 
     def _mark_executed_once_sync(self, pending_action_id: str) -> bool:
         try:
-            with self._connect() as conn:
+            with self._open() as conn:
                 conn.execute(
                     """
                     INSERT INTO executed_actions(pending_action_id, executed_at_ms)
@@ -131,7 +139,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
     def _acquire_run_lease_sync(self, run_id: str, owner_id: str, ttl_ms: int) -> bool:
         now_ms = _now_ms()
         expires_at_ms = now_ms + ttl_ms
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
@@ -161,7 +169,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         await asyncio.to_thread(self._release_run_lease_sync, run_id, owner_id)
 
     def _release_run_lease_sync(self, run_id: str, owner_id: str) -> None:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.execute(
                 "DELETE FROM run_leases WHERE run_id = ? AND owner_id = ?",
                 (run_id, owner_id),
@@ -173,7 +181,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         return await asyncio.to_thread(self._resolve_action_sync, pending_action_id, decision)
 
     def _resolve_action_sync(self, pending_action_id: str, decision: dict) -> RunState:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 action_row = conn.execute(
@@ -231,15 +239,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
                     raise WorkflowError(f"run checkpoint not found: {action.run_id}")
 
                 run_state = RunState(**json.loads(run_row["payload"]))
-                run_state.status = "running"
-                run_state.waiting_action_id = None
-                node_record = run_state.state.setdefault("nodes", {}).setdefault(action.node_id, {})
-                if action.action_type == "human":
-                    node_record["status"] = "success"
-                    node_record["output"] = resolved_decision
-                else:
-                    node_record["status"] = "pending"
-                    node_record["approval"] = resolved_decision
+                self._apply_resolution(run_state, action, pending_action_id, resolved_decision)
                 conn.execute(
                     """
                     UPDATE runs
@@ -258,7 +258,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         return await asyncio.to_thread(self._list_expired_actions_sync, now_ms)
 
     def _list_expired_actions_sync(self, now_ms: int) -> list[PendingAction]:
-        with self._connect() as conn:
+        with self._open() as conn:
             rows = conn.execute(
                 """
                 SELECT payload FROM actions
@@ -272,7 +272,7 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
         return [PendingAction(**json.loads(row["payload"])) for row in rows]
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -302,11 +302,17 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _open(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.isolation_level = None
-        return conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _validated_decision_for_action(self, action: PendingAction, decision: dict) -> dict:
         now_ms = _now_ms()
@@ -323,16 +329,17 @@ class SQLiteCheckpointStore(BaseCheckpointStore):
 class SQLiteEventStore:
     """SQLite event log store for audit and replay."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, migration_registry: Any = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.migration_registry = migration_registry
         self._init_db()
 
     async def append(self, event: WorkflowEvent) -> None:
         await asyncio.to_thread(self._append_sync, event)
 
     def _append_sync(self, event: WorkflowEvent) -> None:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.execute(
                 """
                 INSERT INTO events(run_id, event_type, node_id, payload, created_at_ms)
@@ -351,7 +358,7 @@ class SQLiteEventStore:
         return await asyncio.to_thread(self._list_by_run_sync, run_id)
 
     def _list_by_run_sync(self, run_id: str) -> list[WorkflowEvent]:
-        with self._connect() as conn:
+        with self._open() as conn:
             rows = conn.execute(
                 """
                 SELECT payload FROM events
@@ -360,13 +367,13 @@ class SQLiteEventStore:
                 """,
                 (run_id,),
             ).fetchall()
-        return [workflow_event_from_dict(json.loads(row["payload"])) for row in rows]
+        return [workflow_event_from_dict(json.loads(row["payload"]), migration_registry=self.migration_registry) for row in rows]
 
     async def replace_run(self, run_id: str, events: list[WorkflowEvent]) -> None:
         await asyncio.to_thread(self._replace_run_sync, run_id, events)
 
     def _replace_run_sync(self, run_id: str, events: list[WorkflowEvent]) -> None:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
@@ -392,7 +399,7 @@ class SQLiteEventStore:
                 raise
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._open() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -408,11 +415,121 @@ class SQLiteEventStore:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _open(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.isolation_level = None
-        return conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
+class SQLiteArtifactStore:
+    """SQLite artifact store for local services and small deployments."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    async def put(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        name: str,
+        value: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._put_sync, run_id, node_id, name, value, metadata
+        )
+
+    def _put_sync(
+        self,
+        run_id: str,
+        node_id: str,
+        name: str,
+        value: Any,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        import uuid
+
+        artifact_id = f"art_{uuid.uuid4().hex}"
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        with self._open() as conn:
+            conn.execute(
+                """
+                INSERT INTO artifacts(artifact_id, run_id, node_id, name, payload, metadata, created_at_ms)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    run_id,
+                    node_id,
+                    name,
+                    payload,
+                    json.dumps(dict(metadata or {}), ensure_ascii=False, separators=(",", ":")),
+                    _now_ms(),
+                ),
+            )
+        return {
+            "artifact_id": artifact_id,
+            "run_id": run_id,
+            "node_id": node_id,
+            "name": name,
+            "store": "sqlite",
+        }
+
+    async def get(self, ref: dict[str, Any]) -> Any:
+        return await asyncio.to_thread(self._get_sync, ref)
+
+    def _get_sync(self, ref: dict[str, Any]) -> Any:
+        artifact_id = ref.get("artifact_id")
+        if not isinstance(artifact_id, str):
+            raise WorkflowError("artifact ref missing artifact_id")
+        with self._open() as conn:
+            row = conn.execute(
+                "SELECT payload FROM artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowError(f"artifact not found: {artifact_id}")
+        return json.loads(row["payload"])
+
+    def _init_db(self) -> None:
+        with self._open() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_artifacts_run
+                    ON artifacts(run_id, node_id);
+                """
+            )
+
+    @contextmanager
+    def _open(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.isolation_level = None
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def _action_row(action: PendingAction) -> tuple[Any, ...]:

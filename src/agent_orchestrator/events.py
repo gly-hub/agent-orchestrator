@@ -6,7 +6,7 @@ import asyncio
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from agent_orchestrator.models import (
     WorkflowEvent,
@@ -45,8 +45,9 @@ class NoopEventStore:
 class InMemoryEventStore:
     """In-memory event log suitable for tests and demos."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, migration_registry: Any = None) -> None:
         self._events: dict[str, list[WorkflowEvent]] = {}
+        self.migration_registry = migration_registry
 
     async def append(self, event: WorkflowEvent) -> None:
         self._events.setdefault(event.run_id, []).append(deepcopy(event))
@@ -61,9 +62,10 @@ class InMemoryEventStore:
 class FileEventStore:
     """JSONL event store suitable for local services and integration tests."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, migration_registry: Any = None) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.migration_registry = migration_registry
 
     async def append(self, event: WorkflowEvent) -> None:
         await asyncio.to_thread(self._append_sync, event)
@@ -84,7 +86,7 @@ class FileEventStore:
         events = []
         for line in path.read_text(encoding="utf-8").splitlines():
             if line:
-                events.append(workflow_event_from_dict(json.loads(line)))
+                events.append(workflow_event_from_dict(json.loads(line), migration_registry=self.migration_registry))
         return events
 
     async def replace_run(self, run_id: str, events: list[WorkflowEvent]) -> None:

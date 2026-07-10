@@ -27,9 +27,10 @@ compatibility once the package reaches `1.0`:
 ## Internal Modules
 
 Modules such as `agent_orchestrator.engine`, `parallel`, `subflow`,
-`execution`, `runtime`, and `validation` are importable for advanced
-integrators, but their internals are not the preferred application API. Use
-objects exported from `agent_orchestrator` when possible.
+`execution`, `runtime`, `scheduler`, `engine_protocol`, and `validation`
+are importable for advanced integrators, but their internals are not the
+preferred application API. Use objects exported from `agent_orchestrator`
+when possible.
 
 Names prefixed with `_` are private implementation details.
 

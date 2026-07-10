@@ -7,9 +7,10 @@ import uuid
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import asdict
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from agent_orchestrator.checkpoint import InMemoryCheckpointStore
+from agent_orchestrator.engine_protocol import EngineProtocol
 from agent_orchestrator.exceptions import WorkflowError
 from agent_orchestrator.models import PendingAction, RunState, WorkflowConfig, WorkflowEvent
 from agent_orchestrator.runtime import EVENT_BUFFER, drain
@@ -17,54 +18,6 @@ from agent_orchestrator.state import render_template
 
 logger = logging.getLogger(__name__)
 
-
-class _SubflowEngine(Protocol):
-    agents: Any
-    tools: Any
-    checkpoints: Any
-    event_store: Any
-    artifact_store: Any
-    artifact_threshold_bytes: int | None
-    pending_action_ttl_ms: int | None
-    policy_gate: Any
-    raise_on_error: bool
-    error_observer: Any
-    observer: Any
-
-    async def _render_node_value(
-        self,
-        node: dict[str, Any],
-        run_state: RunState,
-        value: Any,
-    ) -> Any: ...
-
-    async def _save_node_output(
-        self,
-        run_state: RunState,
-        node_id: str,
-        output: Any,
-        *,
-        node: dict[str, Any],
-    ) -> None: ...
-
-    async def _event(
-        self,
-        event_type: str,
-        run_state: RunState,
-        *,
-        node_id: str | None = None,
-        data: dict[str, Any] | None = None,
-    ) -> WorkflowEvent: ...
-
-    async def _record_event(self, event: WorkflowEvent) -> WorkflowEvent: ...
-
-    def _continue(self, run_state: RunState) -> AsyncIterator[WorkflowEvent]: ...
-
-    def _now_ms(self) -> int: ...
-
-    def _expires_at_ms(self) -> int | None: ...
-
-    async def _pause_for_action(self, run_state: RunState, action: PendingAction) -> None: ...
 
 
 class SubflowNodeExecutorMixin:
@@ -75,7 +28,7 @@ class SubflowNodeExecutorMixin:
         node: dict[str, Any],
         run_state: RunState,
     ) -> AsyncIterator[WorkflowEvent]:
-        engine = cast(_SubflowEngine, self)
+        engine = cast(EngineProtocol, self)
         node_record = run_state.state.setdefault("nodes", {}).setdefault(node["id"], {})
 
         if "_subflow_child_state" in node_record and "approval" in node_record:
@@ -101,8 +54,8 @@ class SubflowNodeExecutorMixin:
             waiting_action_id=None,
             state={
                 "input": child_input,
-                "context": run_state.state.get("context", {}),
-                "messages": run_state.state.get("messages", {}),
+                "context": deepcopy(run_state.state.get("context", {})),
+                "messages": deepcopy(run_state.state.get("messages", {})),
                 "nodes": {},
             },
         )
@@ -121,25 +74,11 @@ class SubflowNodeExecutorMixin:
         child_state: RunState,
     ) -> AsyncIterator[WorkflowEvent]:
         child_checkpoints = InMemoryCheckpointStore()
-        engine_factory = cast(Any, type(self))
-        child_engine = engine_factory(
-            child_workflow,
-            agents=engine.agents,
-            tools=engine.tools,
-            checkpoints=child_checkpoints,
-            event_store=engine.event_store,
-            artifact_store=engine.artifact_store,
-            artifact_threshold_bytes=engine.artifact_threshold_bytes,
-            pending_action_ttl_ms=engine.pending_action_ttl_ms,
-            policy_gate=engine.policy_gate,
-            raise_on_error=engine.raise_on_error,
-            error_observer=engine.error_observer,
-            observer=engine.observer,
-        )
+        child_engine = cast(EngineProtocol, self)._create_child_engine(child_workflow, checkpoints=child_checkpoints)
         buffer: list[WorkflowEvent] = []
         token = EVENT_BUFFER.set(buffer)
         try:
-            child_runtime = cast(_SubflowEngine, child_engine)
+            child_runtime = cast(EngineProtocol, child_engine)
             await drain(child_runtime._continue(child_state))
         finally:
             EVENT_BUFFER.reset(token)
@@ -257,6 +196,9 @@ class SubflowNodeExecutorMixin:
         child_human_record = child_state.state["nodes"][child_human_node_id]
         child_human_record["status"] = "success"
         child_human_record["output"] = decision
+        child_human_record.pop("_dag_outgoing_processed", None)
+        child_scheduler = child_state.state.setdefault("_internal", {}).setdefault("scheduler", {})
+        child_scheduler["waiting_actions"] = {}
 
         child_workflow = WorkflowConfig.from_dict(child_workflow_data, validate=False)
         logger.debug("subflow node %s resuming child workflow %s", node["id"], child_workflow.id)

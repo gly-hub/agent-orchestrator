@@ -151,6 +151,50 @@ def test_workflow_config_normalizes_nodes_defensively():
 
     assert config.nodes[0]["branches"][0]["tool"] == "lookup"
 
+
+def test_parallel_branch_rejects_human_nodes():
+    with pytest.raises(WorkflowConfigError, match="cannot be a human node"):
+        WorkflowConfig.from_dict(
+            {
+                "id": "parallel-human",
+                "nodes": [
+                    {
+                        "id": "fanout",
+                        "type": "parallel",
+                        "branches": [
+                            {"id": "confirm", "type": "human", "title": "Confirm"},
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_parallel_workflow_branch_rejects_human_nodes():
+    with pytest.raises(WorkflowConfigError, match="workflow cannot contain human nodes"):
+        WorkflowConfig.from_dict(
+            {
+                "id": "parallel-human-workflow",
+                "nodes": [
+                    {
+                        "id": "fanout",
+                        "type": "parallel",
+                        "branches": [
+                            {
+                                "id": "manual",
+                                "workflow": {
+                                    "nodes": [
+                                        {"id": "confirm", "type": "human", "title": "Confirm"},
+                                    ],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
 def test_normalize_workflow_node_recurses_into_subflow():
     node = normalize_workflow_node(
         {

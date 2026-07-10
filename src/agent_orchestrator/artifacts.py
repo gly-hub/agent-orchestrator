@@ -96,7 +96,9 @@ class FileArtifactStore:
         uri = ref.get("uri")
         if not uri:
             raise WorkflowError("artifact ref missing uri")
-        path = Path(uri)
+        path = Path(uri).resolve()
+        if not path.is_relative_to(self.root.resolve()):
+            raise WorkflowError(f"artifact path outside root: {uri}")
         if not path.exists():
             raise WorkflowError(f"artifact not found: {uri}")
         return json.loads(path.read_text(encoding="utf-8"))

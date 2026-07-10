@@ -57,18 +57,19 @@ asyncio.run(main())
                ┌───────────────────┼───────────────────┐
                │                   │                   │
         ┌──────▼──────┐    ┌──────▼──────┐    ┌───────▼──────┐
-        │   Router     │    │  Executors   │    │   Stores     │
-        │  edges/when  │    │  agent/tool  │    │  checkpoint  │
-        │  conditions  │    │  transform   │    │  event       │
-        │              │    │  human/cond  │    │  artifact    │
+        │ DAG Scheduler│    │  Executors   │    │   Stores     │
+        │ ready queue  │    │  agent/tool  │    │  checkpoint  │
+        │ edge state   │    │  transform   │    │  event       │
+        │ joins/when   │    │  human/cond  │    │  artifact    │
         │              │    │  parallel    │    │              │
         │              │    │  subflow     │    │              │
         │              │    │  loop        │    │              │
         └──────────────┘    └─────────────┘    └──────────────┘
 ```
 
-The engine drives a run through its workflow graph. The **router** picks the next
-node based on edges and `when` conditions. **Executors** run each node type.
+The engine drives a run through its workflow graph. The **DAG scheduler** finds
+all ready nodes from explicit edges, join state, and `when` conditions, then runs
+ready nodes concurrently. **Executors** run each node type.
 **Stores** persist checkpoint state, events, and artifacts.
 
 ## Core Concepts
@@ -76,9 +77,21 @@ node based on edges and `when` conditions. **Executors** run each node type.
 **WorkflowConfig** — a validated DAG of nodes and edges, created from a dict.
 Nodes have types (`agent`, `tool`, `transform`, `human`, `condition`, `parallel`,
 `subflow`, `loop`) and connect via edges with optional `when` conditions.
+Node declaration order is only a stable listing order; execution dependencies
+must be expressed with explicit edges.
+
+**DAG Scheduling** — nodes with no incoming edges are entry nodes and may run
+concurrently. A node with multiple incoming edges is an implicit join. By default,
+it waits for all active incoming paths. Paths skipped by conditions do not block
+the join. Supported join policies:
+
+- `all_active` (default): wait for all active incoming paths
+- `all_success`: wait for all active incoming paths and require success
+- `any`: run after the first active incoming path completes
 
 **RunState** — the mutable state of a single workflow execution. Holds node
-outputs, context, status, and the current position in the graph.
+outputs, context, status, scheduler state, edge activation state, and pending
+human actions.
 
 **Templates** — `{{path.to.value}}` expressions resolve dotted paths from run
 state. Supports `| default(fallback)` filters. When a whole string is a single
@@ -86,8 +99,9 @@ template, the original value type is preserved.
 
 **Human Checkpoints** — `human` nodes pause the run and emit `human.required`.
 The client stores the `pending_action_id`, collects user input, and calls
-`engine.resume(...)` to continue. Human nodes work at top level, inside
-`subflow` nodes, and inside `parallel` branches (sequential fallback).
+`engine.resume(...)` to continue. Human nodes pause only their own DAG path;
+other ready nodes continue running. A run may contain multiple simultaneous
+pending human actions.
 
 **Events** — every lifecycle step emits a `WorkflowEvent`. Events power
 streaming, replay, and compaction.
@@ -97,8 +111,9 @@ streaming, replay, and compaction.
 - 8 node types: `agent`, `tool`, `transform`, `human`, `condition`, `parallel`, `subflow`, `loop`
 - Shared state with `{{path.to.value}}` template resolution and `| default(...)`
 - Condition expressions: `==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`, `and`, `or`, parentheses
-- Human checkpoint and resume flow with response schema validation
-- Human nodes in parallel branches (sequential fallback) and subflow nodes
+- DAG scheduler with concurrent ready nodes, edge activation, and multi-input joins
+- Human checkpoint and resume flow with response schema validation and multiple pending actions
+- Human nodes in concurrent DAG paths and subflow nodes
 - Loop nodes with condition-based exit and max iteration caps
 - Tool confirmation, permissions, risk levels, and policy decisions
 - Tool and agent input/output schema validation
@@ -149,10 +164,9 @@ surface and internal-module policy.
 ## Production Reliability
 
 The checkpoint store is the source of truth for live execution. Event stores are
-append-only audit/replay logs unless an application supplies a transactional
-store pair. See [docs/production_reliability.md](docs/production_reliability.md)
-for failure semantics, resume idempotency, and client rules around
-`human.required`, `run.waiting`, and `run.failed`.
+append-only audit/replay logs unless an application supplies a transactional store
+pair. Streaming clients should treat `run.finished`, `run.failed`, and
+`run.waiting` as the durable terminal states for a stream.
 
 ## Service Flow
 
@@ -303,9 +317,10 @@ Supported failure policies:
 - `fail`: default; any failed branch fails the parallel node
 - `continue`: preserve failed branch output and continue the workflow
 
-Branches containing `human` nodes automatically fall back to sequential execution.
-When a sequential branch hits a human checkpoint, the parallel node pauses the
-entire run. On resume, the branch completes and remaining branches execute.
+For new visual workflows, prefer plain DAG edges for fan-out/fan-in. A `parallel`
+node remains available as a compact compatibility primitive for branch output
+contracts and failure policy, but general joins, conditions, and human waits are
+handled by the DAG scheduler.
 
 ### Subflow Nodes
 

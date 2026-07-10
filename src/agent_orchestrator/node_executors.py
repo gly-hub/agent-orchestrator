@@ -270,7 +270,6 @@ class BasicNodeExecutorMixin:
             "node_id": action.node_id,
             "action_type": action.action_type,
         }
-        await self.checkpoints.save_waiting(run_state, action)
         logger.debug("human node %s creating pending action %s", node["id"], action.id)
         yield await self._event(
             "human.required",
@@ -281,4 +280,5 @@ class BasicNodeExecutorMixin:
                 "request": action.request,
             },
         )
+        await self.checkpoints.save_waiting(run_state, action)
         raise WaitingForUser(action.id)

@@ -6,6 +6,11 @@ Composable Agent Workflow Engine with resumable human checkpoints.
 pip install dandelion-orchestrator
 ```
 
+Composable Agent Workflow Engine with resumable human checkpoints.
+
+**Demo:** [agent-orchestrator-demo](https://github.com/gly-hub/agent-orchestrator-demo) — end-to-end sample app with streaming, human checkpoints, and persistence.
+
+
 ## Quick Start
 
 ```python

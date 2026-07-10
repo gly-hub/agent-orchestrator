@@ -485,3 +485,296 @@ async def test_join_policy_any_runs_after_first_active_predecessor():
     )
     assert first_finished_index < slow_finished_index
     assert calls == ["fast", "slow"]
+
+
+async def test_human_node_inline_resume_during_concurrent_execution():
+    """Resume a human node while another branch is still running."""
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+    release_slow = asyncio.Event()
+
+    async def slow_tool(args, run_state):
+        await release_slow.wait()
+        return {"value": "auto"}
+
+    tools.register("slow", slow_tool)
+    checkpoints = InMemoryCheckpointStore()
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "dag-inline-resume",
+            "version": 1,
+            "nodes": [
+                {"id": "confirm", "type": "human", "title": "Confirm"},
+                {"id": "auto", "type": "tool", "tool": "slow"},
+                {
+                    "id": "after_confirm",
+                    "type": "transform",
+                    "input": {"decision": "{{nodes.confirm.output.decision}}"},
+                },
+                {
+                    "id": "join",
+                    "type": "transform",
+                    "input": {
+                        "confirmed": "{{nodes.after_confirm.output.decision}}",
+                        "auto": "{{nodes.auto.output.value}}",
+                    },
+                },
+            ],
+            "edges": [
+                {"from": "confirm", "to": "after_confirm"},
+                {"from": "after_confirm", "to": "join"},
+                {"from": "auto", "to": "join"},
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools, checkpoints=checkpoints)
+
+    collected_events: list[WorkflowEvent] = []
+    resumed_events: list[WorkflowEvent] = []
+    human_required = asyncio.Event()
+    after_confirm_finished = asyncio.Event()
+    auto_finished = asyncio.Event()
+    pending_action_id_holder: list[str] = []
+
+    async def run_start():
+        async for event in engine.start(StartRunRequest(message="go")):
+            collected_events.append(event)
+            if event.type == "human.required":
+                pending_action_id_holder.append(event.data["pending_action_id"])
+                human_required.set()
+            if event.type == "node.finished" and event.node_id == "after_confirm":
+                after_confirm_finished.set()
+            if event.type == "node.finished" and event.node_id == "auto":
+                auto_finished.set()
+
+    async def run_resume(pending_action_id: str):
+        async for event in engine.resume(
+            pending_action_id=pending_action_id,
+            decision={"decision": "approve"},
+        ):
+            resumed_events.append(event)
+
+    start_task = asyncio.create_task(run_start())
+
+    await human_required.wait()
+    pending_action_id = pending_action_id_holder[0]
+
+    resume_task = asyncio.create_task(run_resume(pending_action_id))
+
+    await asyncio.wait_for(after_confirm_finished.wait(), timeout=1)
+    assert not auto_finished.is_set()
+
+    release_slow.set()
+    await asyncio.wait_for(start_task, timeout=1)
+    await asyncio.wait_for(resume_task, timeout=1)
+
+    assert any(e.type == "run.resumed" for e in resumed_events)
+    assert any(
+        e.type == "node.finished" and e.node_id == "after_confirm"
+        for e in resumed_events
+    )
+    assert any(e.type == "run.finished" for e in collected_events)
+    assert any(
+        e.type == "node.finished" and e.node_id == "join"
+        for e in collected_events
+    )
+
+
+async def test_human_node_resume_fallback_without_future():
+    """When no live future exists, resume uses the old two-phase behavior."""
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+
+    async def auto_tool(args, run_state):
+        return {"value": "auto"}
+
+    tools.register("auto", auto_tool)
+    checkpoints = InMemoryCheckpointStore()
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "dag-fallback-resume",
+            "version": 1,
+            "nodes": [
+                {"id": "confirm", "type": "human", "title": "Confirm"},
+                {"id": "auto", "type": "tool", "tool": "auto"},
+                {
+                    "id": "join",
+                    "type": "transform",
+                    "input": {
+                        "decision": "{{nodes.confirm.output.decision}}",
+                        "auto": "{{nodes.auto.output.value}}",
+                    },
+                },
+            ],
+            "edges": [
+                {"from": "confirm", "to": "join"},
+                {"from": "auto", "to": "join"},
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools, checkpoints=checkpoints)
+
+    first_events = [event async for event in engine.start(StartRunRequest(message="go"))]
+    assert first_events[-1].type == "run.finished" or first_events[-1].type == "run.waiting"
+
+    if first_events[-1].type == "run.waiting":
+        required = [e for e in first_events if e.type == "human.required"][0]
+        pending_action_id = required.data["pending_action_id"]
+
+        engine._pending_action_futures.pop(pending_action_id, None)
+
+        resumed_events = [
+            event
+            async for event in engine.resume(
+                pending_action_id=pending_action_id,
+                decision={"decision": "approve"},
+            )
+        ]
+        assert resumed_events[-1].type == "run.finished"
+        join_finished = [
+            e for e in resumed_events if e.type == "node.finished" and e.node_id == "join"
+        ][0]
+        assert join_finished.data["output"] == {"decision": "approve", "auto": "auto"}
+
+
+async def test_human_resume_detected_from_checkpoint_while_other_branch_runs():
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+    release_slow = asyncio.Event()
+
+    async def slow_tool(args, run_state):
+        await release_slow.wait()
+        return {"value": "auto"}
+
+    tools.register("slow", slow_tool)
+    checkpoints = InMemoryCheckpointStore()
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "dag-human-checkpoint-poll",
+            "version": 1,
+            "nodes": [
+                {"id": "confirm", "type": "human", "title": "Confirm"},
+                {"id": "auto", "type": "tool", "tool": "slow"},
+                {
+                    "id": "after_confirm",
+                    "type": "transform",
+                    "input": {"decision": "{{nodes.confirm.output.decision}}"},
+                },
+                {
+                    "id": "join",
+                    "type": "transform",
+                    "input": {
+                        "confirmed": "{{nodes.after_confirm.output.decision}}",
+                        "auto": "{{nodes.auto.output.value}}",
+                    },
+                },
+            ],
+            "edges": [
+                {"from": "confirm", "to": "after_confirm"},
+                {"from": "after_confirm", "to": "join"},
+                {"from": "auto", "to": "join"},
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools, checkpoints=checkpoints)
+
+    collected_events: list[WorkflowEvent] = []
+    human_required = asyncio.Event()
+    after_confirm_finished = asyncio.Event()
+    auto_finished = asyncio.Event()
+    pending_action_id_holder: list[str] = []
+
+    async def run_start():
+        async for event in engine.start(StartRunRequest(message="go")):
+            collected_events.append(event)
+            if event.type == "human.required":
+                pending_action_id_holder.append(event.data["pending_action_id"])
+                human_required.set()
+            if event.type == "node.finished" and event.node_id == "after_confirm":
+                after_confirm_finished.set()
+            if event.type == "node.finished" and event.node_id == "auto":
+                auto_finished.set()
+
+    start_task = asyncio.create_task(run_start())
+    await human_required.wait()
+    pending_action_id = pending_action_id_holder[0]
+
+    engine._pending_action_futures.pop(pending_action_id, None)
+    resumed_events = [
+        event
+        async for event in engine.resume(
+            pending_action_id=pending_action_id,
+            decision={"decision": "approve"},
+        )
+    ]
+
+    assert [event.type for event in resumed_events] == ["run.resumed"]
+    await asyncio.wait_for(after_confirm_finished.wait(), timeout=1)
+    assert not auto_finished.is_set()
+
+    release_slow.set()
+    await asyncio.wait_for(start_task, timeout=1)
+    assert any(event.type == "run.finished" for event in collected_events)
+
+
+async def test_resume_recovers_when_start_stream_closed_after_human_required():
+    agents = AgentRegistry()
+    tools = ToolRegistry()
+
+    async def auto_tool(args, run_state):
+        return {"value": "auto"}
+
+    tools.register("auto", auto_tool)
+    checkpoints = InMemoryCheckpointStore()
+    workflow = WorkflowConfig.from_dict(
+        {
+            "id": "dag-human-resume-after-stream-close",
+            "version": 1,
+            "nodes": [
+                {"id": "confirm", "type": "human", "title": "Confirm"},
+                {"id": "auto", "type": "tool", "tool": "auto"},
+                {
+                    "id": "after_confirm",
+                    "type": "transform",
+                    "input": {"decision": "{{nodes.confirm.output.decision}}"},
+                },
+                {
+                    "id": "join",
+                    "type": "transform",
+                    "input": {
+                        "confirmed": "{{nodes.after_confirm.output.decision}}",
+                        "auto": "{{nodes.auto.output.value}}",
+                    },
+                },
+            ],
+            "edges": [
+                {"from": "confirm", "to": "after_confirm"},
+                {"from": "after_confirm", "to": "join"},
+                {"from": "auto", "to": "join"},
+            ],
+        }
+    )
+    engine = WorkflowEngine(workflow, agents=agents, tools=tools, checkpoints=checkpoints)
+
+    stream = engine.start(StartRunRequest(message="go"))
+    pending_action_id = None
+    async for event in stream:
+        if event.type == "human.required":
+            pending_action_id = event.data["pending_action_id"]
+            break
+    assert pending_action_id is not None
+    await stream.aclose()
+
+    resumed_events = [
+        event
+        async for event in engine.resume(
+            pending_action_id=pending_action_id,
+            decision={"decision": "approve"},
+        )
+    ]
+
+    assert resumed_events[-1].type == "run.finished"
+    assert any(
+        event.type == "node.finished" and event.node_id == "join"
+        for event in resumed_events
+    )

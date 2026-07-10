@@ -37,7 +37,14 @@ class _SchedulerResultItem:
     waiting_action_id: str | None = None
 
 
-_SchedulerQueueItem = _SchedulerEventItem | _SchedulerResultItem
+@dataclass(slots=True)
+class _SchedulerNodeWaiting:
+    node_id: str
+    pending_action_id: str
+    future: asyncio.Future[dict[str, Any]]
+
+
+_SchedulerQueueItem = _SchedulerEventItem | _SchedulerResultItem | _SchedulerNodeWaiting
 
 
 
@@ -125,19 +132,25 @@ class DagScheduler:
                         node_id=run_state.current_node_id,
                         data=data,
                     )
-                    yield await self.engine._event(
+                    event = await self.engine._event(
                         "run.waiting",
                         run_state,
                         node_id=run_state.current_node_id,
                         data=data,
                     )
+                    self.engine._publish_resume_event(event)
+                    yield event
+                    self.engine._close_resume_event_queues(run_state.run_id)
                     return
 
                 if self._mark_unactivated_pending_nodes_skipped(run_state):
                     continue
                 run_state.status = "completed"
                 logger.info("run %s completed", run_state.run_id)
-                yield await self.engine._event("run.finished", run_state)
+                event = await self.engine._event("run.finished", run_state)
+                self.engine._publish_resume_event(event)
+                yield event
+                self.engine._close_resume_event_queues(run_state.run_id)
                 return
         except Exception as exc:
             run_state.status = "failed"
@@ -148,7 +161,10 @@ class DagScheduler:
                 exc,
             )
             await self.engine._observe_run_failed(exc, run_state)
-            yield await self.engine._run_failed_event(run_state, exc)
+            event = await self.engine._run_failed_event(run_state, exc)
+            self.engine._publish_resume_event(event)
+            yield event
+            self.engine._close_resume_event_queues(run_state.run_id)
             if self.engine.raise_on_error:
                 raise
 
@@ -164,6 +180,7 @@ class DagScheduler:
         scheduler.setdefault("completed_node_ids", [])
         scheduler.setdefault("failed_node_ids", [])
         scheduler.setdefault("skipped_node_ids", [])
+        self._recover_interrupted_nodes(run_state)
 
         for edge in self.graph.edges:
             edge_state.setdefault(
@@ -179,6 +196,20 @@ class DagScheduler:
         for node_id in self.graph.entry_node_ids:
             self._node_record(run_state, node_id).setdefault("activated", True)
 
+    def _recover_interrupted_nodes(self, run_state: RunState) -> None:
+        scheduler = self._scheduler(run_state)
+        interrupted_node_ids = {
+            *scheduler.get("ready_node_ids", []),
+            *scheduler.get("running_node_ids", []),
+        }
+        scheduler["ready_node_ids"] = []
+        scheduler["running_node_ids"] = []
+
+        for node_id in interrupted_node_ids:
+            record = self._node_record(run_state, node_id)
+            if record.get("status") in {"ready", "running"}:
+                record["status"] = "pending"
+
     async def _run_ready_nodes(
         self,
         run_state: RunState,
@@ -187,6 +218,9 @@ class DagScheduler:
         queue: asyncio.Queue[_SchedulerQueueItem] = asyncio.Queue()
         tasks: list[asyncio.Task[None]] = []
         remaining = 0
+        waiting_for_human = 0
+        waiting_nodes: set[str] = set()
+        waiting_emitted = False
 
         def start_nodes(start_node_ids: list[str]) -> None:
             nonlocal remaining
@@ -204,14 +238,75 @@ class DagScheduler:
                 )
                 remaining += 1
 
+        async def emit_waiting_if_only_humans_remain() -> WorkflowEvent | None:
+            if not waiting_for_human or waiting_for_human != remaining:
+                return None
+            waiting_actions = self._waiting_actions(run_state)
+            await self._save_waiting_checkpoint(run_state, waiting_actions)
+            run_state.status = "waiting_for_user"
+            pending_action_ids = sorted(waiting_actions)
+            data: dict[str, Any] = {"pending_action_ids": pending_action_ids}
+            if len(pending_action_ids) == 1:
+                data["pending_action_id"] = pending_action_ids[0]
+                run_state.waiting_action_id = pending_action_ids[0]
+            else:
+                run_state.waiting_action_id = None
+            logger.info(
+                "run %s waiting for user actions %s",
+                run_state.run_id,
+                ", ".join(pending_action_ids),
+            )
+            await self.engine.execution.observe(
+                "run.waiting",
+                run_state,
+                node_id=run_state.current_node_id,
+                data=data,
+            )
+            event = await self.engine._event(
+                "run.waiting",
+                run_state,
+                node_id=run_state.current_node_id,
+                data=data,
+            )
+            self.engine._publish_resume_event(event)
+            return event
+
         start_nodes(node_ids)
         try:
             while remaining:
                 item = await queue.get()
                 if isinstance(item, _SchedulerEventItem):
+                    self.engine._publish_resume_event(item.event)
                     yield item.event
                     continue
+                if isinstance(item, _SchedulerNodeWaiting):
+                    waiting_for_human += 1
+                    waiting_nodes.add(item.node_id)
+                    tasks.append(
+                        asyncio.create_task(
+                            self._wait_and_complete_node(
+                                item.node_id,
+                                item.pending_action_id,
+                                item.future,
+                                run_state,
+                                queue,
+                            ),
+                            name=f"dag:wait:{item.node_id}",
+                        )
+                    )
+                    if waiting_for_human == remaining and not waiting_emitted:
+                        event = await emit_waiting_if_only_humans_remain()
+                        if event is None:
+                            continue
+                        yield event
+                        self.engine._close_resume_event_queues(run_state.run_id)
+                        return
+                    continue
                 remaining -= 1
+                if item.node_id in waiting_nodes:
+                    waiting_for_human -= 1
+                    waiting_nodes.discard(item.node_id)
+                    waiting_emitted = False
                 if item.error is not None:
                     run_state.current_node_id = item.node_id
                     for task in tasks:
@@ -220,6 +315,12 @@ class DagScheduler:
                     raise item.error
                 self._process_completed_nodes(run_state)
                 start_nodes(self._ready_node_ids(run_state))
+                if waiting_for_human == remaining and not waiting_emitted:
+                    event = await emit_waiting_if_only_humans_remain()
+                    if event is not None:
+                        yield event
+                        self.engine._close_resume_event_queues(run_state.run_id)
+                        return
         finally:
             for task in tasks:
                 if not task.done():
@@ -253,7 +354,21 @@ class DagScheduler:
                     exc.pending_action_id,
                     {"node_id": node_id, "action_type": "human"},
                 )
-                await queue.put(_SchedulerResultItem(node_id=node_id, waiting_action_id=exc.pending_action_id))
+                action_entry = self._waiting_actions(run_state)[exc.pending_action_id]
+                if action_entry.get("action_type") == "human":
+                    loop = asyncio.get_running_loop()
+                    future = self.engine._pending_action_futures.get(exc.pending_action_id)
+                    if future is None or future.done():
+                        future = loop.create_future()
+                        self.engine._pending_action_futures[exc.pending_action_id] = future
+                    await self._save_waiting_checkpoint_for_node(run_state, exc.pending_action_id)
+                    await queue.put(_SchedulerNodeWaiting(
+                        node_id=node_id,
+                        pending_action_id=exc.pending_action_id,
+                        future=future,
+                    ))
+                else:
+                    await queue.put(_SchedulerResultItem(node_id=node_id, waiting_action_id=exc.pending_action_id))
                 return
             except Exception as exc:
                 if not self.graph.has_error_edge(node_id):
@@ -292,6 +407,76 @@ class DagScheduler:
         except Exception as exc:
             self._remove_once(scheduler["running_node_ids"], node_id)
             await queue.put(_SchedulerResultItem(node_id=node_id, error=exc))
+
+    async def _wait_and_complete_node(
+        self,
+        node_id: str,
+        pending_action_id: str,
+        future: asyncio.Future[dict[str, Any]],
+        run_state: RunState,
+        queue: asyncio.Queue[_SchedulerQueueItem],
+    ) -> None:
+        try:
+            self.engine._live_waiting_action_ids.add(pending_action_id)
+            decision = await self._wait_for_pending_action_resolution(pending_action_id, future)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            await queue.put(_SchedulerResultItem(node_id=node_id, error=exc))
+            return
+        finally:
+            self.engine._live_waiting_action_ids.discard(pending_action_id)
+            self.engine._pending_action_futures.pop(pending_action_id, None)
+
+        node_record = self._node_record(run_state, node_id)
+        node_record["status"] = "success"
+        node_record["output"] = decision
+        node_record.pop("_dag_outgoing_processed", None)
+        node_record["finished_at_ms"] = self.engine.execution.now_ms()
+        if "started_at_ms" in node_record:
+            node_record["duration_ms"] = node_record["finished_at_ms"] - node_record["started_at_ms"]
+
+        self._waiting_actions(run_state).pop(pending_action_id, None)
+        run_state.status = "running"
+        run_state.waiting_action_id = None
+
+        node_run_state = replace(run_state, current_node_id=node_id)
+        await self.engine.execution.observe_node_finished(node_run_state, node_id, node_record)
+        await queue.put(
+            _SchedulerEventItem(
+                await self.engine._event("node.finished", node_run_state, node_id=node_id, data=node_record)
+            )
+        )
+
+        scheduler = self._scheduler(run_state)
+        scheduler["completed_node_ids"].append(node_id)
+        self._activate_outgoing_edges(run_state, node_id)
+        await queue.put(_SchedulerResultItem(node_id=node_id))
+
+    async def _wait_for_pending_action_resolution(
+        self,
+        pending_action_id: str,
+        future: asyncio.Future[dict[str, Any]],
+    ) -> dict[str, Any]:
+        while True:
+            if future.done():
+                return future.result()
+
+            action = await self.engine.checkpoints.load_action(pending_action_id)
+            if action.status in {"approved", "rejected"} and action.decision is not None:
+                return action.decision
+            if action.status == "expired":
+                raise TimeoutError(f"pending action expired: {pending_action_id}")
+
+            await asyncio.sleep(0.05)
+
+    async def _save_waiting_checkpoint_for_node(
+        self,
+        run_state: RunState,
+        pending_action_id: str,
+    ) -> None:
+        action = await self.engine.checkpoints.load_action(pending_action_id)
+        await self.engine.checkpoints.save_waiting(run_state, action)
 
     def _process_completed_nodes(self, run_state: RunState) -> None:
         for node_id in self.graph.node_ids:

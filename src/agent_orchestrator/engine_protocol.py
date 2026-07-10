@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
@@ -23,6 +24,8 @@ class EngineProtocol(Protocol):
     raise_on_error: bool
     error_observer: Any
     observer: Any
+    _pending_action_futures: dict[str, asyncio.Future[dict[str, Any]]]
+    _live_waiting_action_ids: set[str]
 
     async def _event(
         self,
@@ -68,6 +71,10 @@ class EngineProtocol(Protocol):
     async def _observe_run_failed(self, exc: Exception, run_state: RunState) -> None: ...
 
     async def _run_failed_event(self, run_state: RunState, exc: Exception) -> WorkflowEvent: ...
+
+    def _publish_resume_event(self, event: WorkflowEvent) -> None: ...
+
+    def _close_resume_event_queues(self, run_id: str) -> None: ...
 
     def _create_child_engine(
         self,
